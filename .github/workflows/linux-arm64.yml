@@ -3,7 +3,8 @@
 # Why a separate workflow from release.yml: release.yml builds the OFFICIAL macOS/Windows
 # installers (signed + notarized, publishing the auto-update manifest). This one exists so
 # forks and self-builders can produce a Linux/aarch64 build without the Apple secrets, the
-# updater key, or a tag — a plain manual run is enough.
+# updater key, or a tag — a plain manual run is enough. It also publishes the results to a
+# fixed `linux-arm64` release so there is a stable download URL instead of a per-run artifact.
 #
 # Runner: `ubuntu-24.04-arm` — a NATIVE arm64 machine from GitHub/Arm (free for public repos).
 # It has to be native: the Python sidecar is a PyInstaller freeze of CPython, and PyInstaller
@@ -85,8 +86,7 @@ jobs:
             libclang-dev \
             pkg-config \
             file \
-            xz-utils \
-            rpm
+            xz-utils
 
       - name: Set up the sidecar venv (.venv)
         # Mirrors release.yml: the build script expects a venv at .venv with the package +
@@ -115,6 +115,14 @@ jobs:
         continue-on-error: true
         run: npm run tauri build -- --bundles appimage
 
+      - name: Checksums
+        working-directory: surfaces/gui/src-tauri/target/release/bundle
+        run: |
+          rm -f SHA256SUMS
+          find . -maxdepth 2 -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.tar.gz' \) \
+            -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Inspect the bundles
         # Where the bundler actually put the sidecar matters at runtime (src-tauri/src/lib.rs
         # `server_bin` walks several candidate paths). Print it so a layout change is visible
@@ -128,8 +136,7 @@ jobs:
             [ -f "$deb" ] || continue
             echo "--- $deb"
             dpkg-deb -I "$deb" | sed -n '1,25p'
-            dpkg-deb -c "$deb" | grep -Ei 'sidecar|openworker' | sed -n '1,15p'
-            dpkg-deb -c "$deb" | grep -c sidecar
+            dpkg-deb -c "$deb" | grep -Ei 'sidecar|/usr/bin|\.desktop' | sed -n '1,15p'
           done
           for appimage in appimage/*.AppImage; do
             [ -f "$appimage" ] || continue
@@ -154,5 +161,50 @@ jobs:
             surfaces/gui/src-tauri/target/release/bundle/deb/*.deb
             surfaces/gui/src-tauri/target/release/bundle/appimage/*.AppImage
             surfaces/gui/src-tauri/target/release/bundle/*.tar.gz
+            surfaces/gui/src-tauri/target/release/bundle/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    # A stable download URL beats a per-run artifact: the tag never moves, so
+    #   github.com/<owner>/openworker/releases/download/linux-arm64/<file>
+    # keeps working across rebuilds. `make_latest: false` keeps it out of the way of the
+    # project's own releases in this fork.
+    needs: build-arm64
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: linux-arm64
+          name: OpenWorker for Linux arm64 (unofficial build)
+          prerelease: false
+          make_latest: false
+          files: dist/**/*
+          body: |
+            Unofficial **arm64/aarch64 Linux** build of OpenWorker, produced by
+            [`.github/workflows/linux-arm64.yml`](../blob/main/.github/workflows/linux-arm64.yml)
+            on a native arm64 runner. Upstream ships macOS and Windows only.
+
+            | File | What it is |
+            | --- | --- |
+            | `OpenWorker_*_arm64.deb` | Debian/Ubuntu package (`sudo apt install ./OpenWorker_*_arm64.deb`). Installs the binary in `/usr/bin` and the Python sidecar in `/usr/lib/OpenWorker/sidecar`. |
+            | `OpenWorker_*_aarch64.AppImage` | Single-file portable app. `chmod +x` and run. Needs FUSE, or extract it with `--appimage-extract`. |
+            | `openworker-*linux-aarch64.tar.gz` | Plain tarball, no package manager and no root: unpack and run `./run.sh`. Keeps `sidecar/` next to the binary. |
+            | `SHA256SUMS` | Checksums for the three files above. |
+
+            Runtime libraries (not bundled): `libwebkit2gtk-4.1-0`, `libgtk-3-0`,
+            `libayatana-appindicator3-1`, `librsvg2-2`.
+
+            ```
+            sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2
+            ```
+
+            Voice input is disabled on Linux (the dictation engine supports macOS and Windows).
