@@ -22,6 +22,7 @@ on:
     paths:
       - ".github/workflows/linux-arm64.yml"
       - "packaging/build_linux.sh"
+      - "packaging/make_full_bundle.sh"
       - "packaging/openworker-server.spec"
       - "surfaces/gui/src-tauri/**"
       - "coworker/**"
@@ -115,6 +116,12 @@ jobs:
         continue-on-error: true
         run: npm run tauri build -- --bundles appimage
 
+      - name: Build the self-contained tarball
+        # Repacks the AppImage's AppDir as a plain directory tree, so there is a variant that
+        # needs neither a package manager, nor root, nor FUSE, nor a system GTK/WebKitGTK.
+        continue-on-error: true
+        run: bash packaging/make_full_bundle.sh
+
       - name: Checksums
         working-directory: surfaces/gui/src-tauri/target/release/bundle
         run: |
@@ -152,6 +159,15 @@ jobs:
             ls -la "$appimage"
             "$appimage" --appimage-extract >/dev/null 2>&1 || true
             find squashfs-root -maxdepth 4 -name sidecar -o -maxdepth 4 -name 'openworker-server' | sed -n '1,15p'
+            echo "--- bundled GUI stack (this is what makes the AppImage self-contained)"
+            find squashfs-root \( -name 'libwebkit2gtk*' -o -name 'libgtk-3.so*' \
+                 -o -name 'libjavascriptcoregtk*' -o -name 'libayatana-appindicator3*' \) \
+              | sort | sed -n '1,12p'
+            echo "    .so files in image: $(find squashfs-root -name '*.so*' | wc -l)"
+            # If webkit is not in the image then the AppImage is NOT self-contained and the
+            # release notes (and make_full_bundle.sh) would be claiming something untrue.
+            find squashfs-root -name 'libwebkit2gtk-4.1.so*' | grep -q . \
+              || { echo "ERROR: libwebkit2gtk-4.1 is not bundled in the AppImage"; exit 1; }
             rm -rf squashfs-root
           done
           for tarball in *.tar.gz; do
@@ -201,18 +217,26 @@ jobs:
             [`.github/workflows/linux-arm64.yml`](../blob/main/.github/workflows/linux-arm64.yml)
             on a native arm64 runner. Upstream ships macOS and Windows only.
 
-            | File | What it is |
-            | --- | --- |
-            | `OpenWorker_*_arm64.deb` | Debian/Ubuntu package (`sudo apt install ./OpenWorker_*_arm64.deb`). Installs the binary in `/usr/bin` and the Python sidecar in `/usr/lib/OpenWorker/sidecar`. |
-            | `OpenWorker_*_aarch64.AppImage` | Single-file portable app. `chmod +x` and run. Needs FUSE, or extract it with `--appimage-extract`. |
-            | `openworker-*linux-aarch64.tar.gz` | Plain tarball, no package manager and no root: unpack and run `./run.sh`. Keeps `sidecar/` next to the binary. |
-            | `SHA256SUMS` | Checksums for the three files above. |
+            | File | What it is | Needs GUI libs? |
+            | --- | --- | --- |
+            | `OpenWorker_*_arm64.deb` | Debian/Ubuntu package (`sudo apt install ./OpenWorker_*_arm64.deb`). Installs the binary in `/usr/bin` and the Python sidecar in `/usr/lib/OpenWorker/sidecar`. | yes, via `Depends:` |
+            | `OpenWorker_*_aarch64.AppImage` | Single-file portable app. `chmod +x` and run. Needs FUSE, or extract it with `--appimage-extract`. | no, bundled |
+            | `openworker-*-linux-*-full.tar.gz` | **Self-contained**: the AppImage's AppDir unpacked, so no FUSE and nothing to install. Unpack and run `./run.sh`. | no, bundled |
+            | `openworker-*-linux-*.tar.gz` | Smallest tarball: no package manager and no root, unpack and run `./run.sh`. Keeps `sidecar/` next to the binary. | yes |
+            | `SHA256SUMS` | Checksums for the files above. | |
 
-            Runtime libraries (not bundled): `libwebkit2gtk-4.1-0`, `libgtk-3-0`,
-            `libayatana-appindicator3-1`, `librsvg2-2`.
+            The `.deb` deliberately depends on the distro's GUI stack instead of shipping a
+            second copy of WebKitGTK (Debian policy, and it avoids conflicting with security
+            updates). The two container-less variants that do not touch the package manager —
+            the AppImage and the `-full` tarball — carry the GUI stack inside them.
 
             ```
+            # only needed for the .deb and the plain tarball
             sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2
             ```
+
+            None of these can bundle the C library: the binaries need the glibc of the machine
+            they were built on, so `ldd --version` on the target must be at least as new as the
+            runner's.
 
             Voice input is disabled on Linux (the dictation engine supports macOS and Windows).
