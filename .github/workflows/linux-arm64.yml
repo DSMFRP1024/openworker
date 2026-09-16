@@ -136,7 +136,15 @@ jobs:
             [ -f "$deb" ] || continue
             echo "--- $deb"
             dpkg-deb -I "$deb" | sed -n '1,25p'
-            dpkg-deb -c "$deb" | grep -Ei 'sidecar|/usr/bin|\.desktop' | sed -n '1,15p'
+            echo "--- executables + desktop entry"
+            dpkg-deb -c "$deb" | grep -E 'usr/bin/|usr/share/applications|\.desktop$'
+            dpkg-deb -x "$deb" /tmp/ocw-deb
+            cat /tmp/ocw-deb/usr/share/applications/*.desktop
+            ls -l /tmp/ocw-deb/usr/bin/
+            # The shell looks for the sidecar next to the executable and under ../lib/*/ —
+            # assert the shipped layout is one of those shapes rather than trusting the log.
+            test -x "/tmp/ocw-deb/usr/lib/$(ls /tmp/ocw-deb/usr/lib | head -1)/sidecar/openworker-server"
+            rm -rf /tmp/ocw-deb
           done
           for appimage in appimage/*.AppImage; do
             [ -f "$appimage" ] || continue
