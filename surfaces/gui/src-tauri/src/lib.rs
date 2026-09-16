@@ -169,14 +169,19 @@ fn sidecar_env() -> std::collections::HashMap<String, String> {
 
 /// Path to the server entrypoint. Resolution order:
 ///   1. `COWORKER_SERVER_BIN` env override.
-///   2. The bundled onedir sidecar shipped via Tauri `resources` (production): the
-///      `sidecar/` folder lands in Contents/Resources on macOS and in the install dir
-///      (next to the app exe) on Windows.
+///   2. The bundled onedir sidecar shipped via Tauri `resources` (production).
 ///   3. Legacy onefile slot: `openworker-server[.exe]` next to the app binary (pre-onedir
 ///      builds used Tauri externalBin).
 ///   4. Dev fallback: the repo venv, relative to this crate (`src-tauri` → repo-root `.venv`;
 ///      `bin/` on POSIX, `Scripts\` on Windows).
-fn server_bin() -> PathBuf {
+///
+/// `resource_dir` is Tauri's own answer for where `resources` were installed (via
+/// `AppHandle::path().resource_dir()`), which is the only portable way to find them: Windows
+/// and a portable tarball put `sidecar/` next to the exe, macOS uses Contents/Resources, and
+/// Linux uses a *per-product* folder (`/usr/lib/<product>` for a deb, `$APPDIR/usr/lib/<product>`
+/// in an AppImage) whose name is the bundler's to choose — so the `lib/` children are scanned
+/// rather than guessed at.
+fn server_bin(resource_dir: Option<PathBuf>) -> PathBuf {
     if let Ok(p) = std::env::var("COWORKER_SERVER_BIN") {
         return PathBuf::from(p);
     }
@@ -190,8 +195,16 @@ fn server_bin() -> PathBuf {
             // macOS: Contents/MacOS/<app> → Contents/Resources/sidecar/; Windows: resources
             // unpack next to the exe, so <install>/sidecar/.
             let mut candidates = vec![dir.join("sidecar").join(exe_name)];
-            if let Some(contents) = dir.parent() {
-                candidates.push(contents.join("Resources").join("sidecar").join(exe_name));
+            if let Some(prefix) = dir.parent() {
+                candidates.push(prefix.join("Resources").join("sidecar").join(exe_name));
+                if let Ok(entries) = std::fs::read_dir(prefix.join("lib")) {
+                    for entry in entries.flatten() {
+                        candidates.push(entry.path().join("sidecar").join(exe_name));
+                    }
+                }
+            }
+            if let Some(rd) = resource_dir {
+                candidates.push(rd.join("sidecar").join(exe_name));
             }
             candidates.push(dir.join(exe_name)); // legacy onefile externalBin slot
             for c in candidates {
@@ -746,7 +759,10 @@ pub fn run() {
         ])
         .setup(move |app| {
             // 1. Start the Python server sidecar on the chosen port (inherits our env).
-            let mut server_cmd = Command::new(server_bin());
+            // Where the bundled `sidecar/` lives is platform- and bundle-dependent — ask
+            // Tauri (see `server_bin`), which resolves the AppImage/deb resource dir for us.
+            let resource_dir = app.path().resource_dir().ok();
+            let mut server_cmd = Command::new(server_bin(resource_dir));
             server_cmd
                 .args(["--host", "127.0.0.1", "--port", &port.to_string()])
                 // The user's real shell environment (PATH to their tools, AWS_PROFILE,

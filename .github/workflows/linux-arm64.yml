@@ -1,0 +1,153 @@
+# Linux arm64 desktop builds (.deb + .AppImage + portable .tar.gz).
+#
+# Why a separate workflow from release.yml: release.yml builds the OFFICIAL macOS/Windows
+# installers (signed + notarized, publishing the auto-update manifest). This one exists so
+# forks and self-builders can produce a Linux/aarch64 build without the Apple secrets, the
+# updater key, or a tag — a plain manual run is enough.
+#
+# Runner: `ubuntu-24.04-arm` — a NATIVE arm64 machine from GitHub/Arm (free for public repos).
+# It has to be native: the Python sidecar is a PyInstaller freeze of CPython, and PyInstaller
+# cannot cross-compile, so an x86 runner can only ever produce an x86 sidecar.
+#
+# Python 3.10+ / Node 20+ / Rust are provisioned the same way release.yml does it, then the
+# build calls the SAME script a developer runs locally: packaging/build_linux.sh.
+
+name: Linux arm64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/linux-arm64.yml"
+      - "packaging/build_linux.sh"
+      - "packaging/openworker-server.spec"
+      - "surfaces/gui/src-tauri/**"
+      - "coworker/**"
+      - "stt/**"
+
+concurrency:
+  group: linux-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          uname -m
+          rustc -vV || true
+          python3 -V || true
+          node -v || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: surfaces/gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The stt crate is built as a path dependency through src-tauri, so one workspace
+          # cache entry covers both — no need to list them separately.
+          workspaces: surfaces/gui/src-tauri
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        # Tauri v2 (webkit2gtk-4.1 + gtk3 + appindicator + rsvg + patchelf) and the two native
+        # crates the desktop shell pulls in via ocw-stt: cpal needs ALSA, whisper-rs compiles
+        # whisper.cpp through bindgen (libclang) and cmake.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            libssl-dev \
+            patchelf \
+            cmake \
+            clang \
+            libclang-dev \
+            pkg-config \
+            file \
+            xz-utils \
+            rpm
+
+      - name: Set up the sidecar venv (.venv)
+        # Mirrors release.yml: the build script expects a venv at .venv with the package +
+        # PyInstaller. typer/tzdata are build-time-only (PyInstaller walks mcp.cli, which needs
+        # typer; tzdata ships zoneinfo for Windows and is harmless here).
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[bedrock]" pyinstaller typer tzdata
+          .venv/bin/python -c "import aisuite, coworker; print('sidecar imports OK')"
+
+      - name: npm ci
+        working-directory: surfaces/gui
+        run: npm ci
+
+      - name: Build .deb + portable .tar.gz
+        run: bash packaging/build_linux.sh
+        env:
+          OCW_BUNDLES: deb
+
+      - name: Build .AppImage (best effort)
+        # Tauri's AppImage bundler drives linuxdeploy/linuxdeploy-plugin-gtk binaries that are
+        # less well-trodden on aarch64 than on x86_64. A failure here must not sink the job —
+        # the .deb and the portable .tar.gz are the primary deliverables.
+        working-directory: surfaces/gui
+        continue-on-error: true
+        run: npm run tauri build -- --bundles appimage
+
+      - name: Inspect the bundles
+        # Where the bundler actually put the sidecar matters at runtime (src-tauri/src/lib.rs
+        # `server_bin` walks several candidate paths). Print it so a layout change is visible
+        # in the log instead of only as a failed launch on someone's machine.
+        if: always()
+        working-directory: surfaces/gui/src-tauri/target/release/bundle
+        run: |
+          set -x
+          ls -la . || true
+          for deb in deb/*.deb; do
+            [ -f "$deb" ] || continue
+            echo "--- $deb"
+            dpkg-deb -I "$deb" | sed -n '1,25p'
+            dpkg-deb -c "$deb" | grep -Ei 'sidecar|openworker' | sed -n '1,15p'
+            dpkg-deb -c "$deb" | grep -c sidecar
+          done
+          for appimage in appimage/*.AppImage; do
+            [ -f "$appimage" ] || continue
+            echo "--- $appimage"
+            ls -la "$appimage"
+            "$appimage" --appimage-extract >/dev/null 2>&1 || true
+            find squashfs-root -maxdepth 4 -name sidecar -o -maxdepth 4 -name 'openworker-server' | sed -n '1,15p'
+            rm -rf squashfs-root
+          done
+          ls -la ../../../../../../packaging/dist-portable 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openworker-linux-arm64
+          path: |
+            surfaces/gui/src-tauri/target/release/bundle/deb/*.deb
+            surfaces/gui/src-tauri/target/release/bundle/appimage/*.AppImage
+            surfaces/gui/src-tauri/target/release/bundle/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
