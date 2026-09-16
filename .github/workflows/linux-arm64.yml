@@ -139,7 +139,12 @@ jobs:
             find squashfs-root -maxdepth 4 -name sidecar -o -maxdepth 4 -name 'openworker-server' | sed -n '1,15p'
             rm -rf squashfs-root
           done
-          ls -la ../../../../../../packaging/dist-portable 2>/dev/null || true
+          for tarball in *.tar.gz; do
+            [ -f "$tarball" ] || continue
+            echo "--- $tarball"
+            tar -tzf "$tarball" | sed -n '1,8p'
+            echo "    entries: $(tar -tzf "$tarball" | wc -l)"
+          done
 
       - uses: actions/upload-artifact@v4
         if: always()

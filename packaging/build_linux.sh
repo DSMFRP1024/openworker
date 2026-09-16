@@ -76,7 +76,13 @@ echo "==> [4/4] portable tarball (sidecar next to the binary)"
 STAGE="$HERE/dist-portable/openworker-$VERSION-linux-$ARCH"
 rm -rf "$HERE/dist-portable"
 mkdir -p "$STAGE"
-cp "$GUI/src-tauri/target/release/$APP" "$STAGE/$APP"
+# On Linux the release executable keeps the Cargo PACKAGE name (`openworker-desktop`) — the
+# `productName` only names the bundle, unlike macOS/Windows where the executable itself is
+# renamed to it. Read the package name out of Cargo.toml instead of hardcoding either value.
+CARGO_NAME="$(sed -n 's/^name = "\(.*\)"/\1/p' "$GUI/src-tauri/Cargo.toml" | head -1)"
+RELEASE_BIN="$GUI/src-tauri/target/release/$CARGO_NAME"
+[ -x "$RELEASE_BIN" ] || { echo "ERROR: release binary not found at $RELEASE_BIN" >&2; exit 1; }
+cp "$RELEASE_BIN" "$STAGE/$APP"
 cp -RL "$SIDECAR" "$STAGE/sidecar"
 cat > "$STAGE/README.txt" <<EOF
 OpenWorker $VERSION — Linux $ARCH (portable)
