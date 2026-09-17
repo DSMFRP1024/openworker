@@ -48,15 +48,13 @@ jobs:
       # to exist first. (It is also a hard requirement for the git-pinned aisuite dependency.)
       - name: Tooling (git, curl, compilers, patchelf)
         run: |
-          # Debian 11 is past LTS: bullseye-security has been pulled from deb.debian.org (the
-          # pool 404s) while the main suite is still served, so a plain `apt-get update` fails
-          # on the security suite and takes the whole step with it. Point apt at the archive —
-          # the frozen final state of the release, which is exactly what we want to build
-          # against — and stop demanding a valid-until date on its expired Release files.
-          printf '%s\n' \
-            'deb http://archive.debian.org/debian bullseye main' \
-            'deb http://archive.debian.org/debian-security bullseye-security main' \
-            > /etc/apt/sources.list
+          # Debian 11 is past LTS and its security suite is gone from EVERY mirror: the pool
+          # 404s on deb.debian.org, and archive.debian.org carries no bullseye-security
+          # Release file at all. Point apt at the archive (the frozen final state of the
+          # release — exactly what we want to build against) with the security suite dropped,
+          # and stop demanding a valid-until date on its expired Release file. This container
+          # only needs build tooling out of main; nothing it installs is shipped.
+          printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
           rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
           apt-get update
@@ -149,14 +147,11 @@ jobs:
       - name: Tooling (curl only)
         run: |
           # Same Debian 11 archive move as the build job — see the comment there.
-          printf '%s\n' \
-            'deb http://archive.debian.org/debian bullseye main' \
-            'deb http://archive.debian.org/debian-security bullseye-security main' \
-            > /etc/apt/sources.list
+          printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
           rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
           apt-get update
-          apt-get install -y --no-install-recommends curl
+          apt-get install -y --no-install-recommends curl ca-certificates
           rm -rf /var/lib/apt/lists/*
           echo "--- glibc of the test host ---"
           ldd --version | head -1
