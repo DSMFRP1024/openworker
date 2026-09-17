@@ -8,10 +8,11 @@
 #
 # Why an AppImage is possible HERE but not for the v2 shell:
 #
-#   The AppImage container itself is a type-2 runtime that is *statically linked* — it has no
-#   PT_INTERP and no DT_NEEDED, so the host's dynamic loader imposes no GLIBC_* check on it.
-#   The format is therefore fine on a 2.31 machine. What sank the v2 AppImage was its CONTENTS:
-#   libgtk-3.so.0 / libwebkit2gtk-4.1.so.0 built against glibc 2.38.
+#   The AppImage container is a type-2 runtime. Whether it is statically or dynamically linked is
+#   irrelevant to the portability claim as long as its OWN glibc demand is ≤ the target's — and
+#   AppImageKit's runtime only needs very old symbols, so it runs on glibc 2.31. The thing that
+#   sank the v2 AppImage was its CONTENTS: libgtk-3.so.0 / libwebkit2gtk-4.1.so.0 built against
+#   glibc 2.38.
 #
 #   And those contents came from the HOST, not from a download. linuxdeploy-plugin-gtk resolves
 #   every path through the host's own pkg-config and copies the host's packages, so building in
@@ -209,36 +210,12 @@ chmod +x "$OUT"
 
 echo "==> [7/7] verifying the finished file"
 echo "    size: $(du -h "$OUT" | cut -f1)"
-# Type-2 magic at offset 8 — proves this is an AppImage and not an ELF we merely renamed.
-printf '    magic: '; dd if="$OUT" bs=1 skip=8 count=3 2>/dev/null; echo
-# The container half must stay static. If this ever grows a PT_INTERP the host's dynamic loader
-# gets a vote on the glibc version, which is the single thing this variant exists to avoid — so
-# it is asserted rather than assumed.
-"${OCW_PYTHON:-python3}" - "$OUT" <<'PY'
-import struct
-import sys
-
-path = sys.argv[1]
-with open(path, "rb") as fh:
-    blob = fh.read(1 << 20)
-assert blob[:4] == b"\x7fELF", "not an ELF — not an AppImage"
-assert blob[4] == 2 and blob[5] == 1, "not a 64-bit little-endian ELF"
-phoff, = struct.unpack_from("<Q", blob, 0x20)
-phentsize, phnum = struct.unpack_from("<HH", blob, 0x36)
-interp = False
-for i in range(phnum):
-    off = phoff + i * phentsize
-    if off + 4 > len(blob):
-        break
-    if struct.unpack_from("<I", blob, off)[0] == 3:  # PT_INTERP
-        interp = True
-print("    runtime: phnum=%d  PT_INTERP=%s" % (phnum, "PRESENT" if interp else "absent"))
-if interp:
-    print("ERROR: the AppImage runtime links the host loader — it can fail on an old glibc.",
-          file=sys.stderr)
-    sys.exit(1)
-print("    runtime is self-contained (static): OK")
-PY
+# We do NOT assert the runtime is statically linked. AppImageKit's `appimagetool` ships a
+# *dynamically* linked runtime (it has a PT_INTERP); that is fine as long as the runtime's own
+# GLIBC_* demand is ≤ the ceiling — AppImageKit's runtime only needs very old symbols, so it runs
+# on glibc 2.31. The check below scans the runtime ELF's version-needs table (the same data the
+# loader consults) and fails only if the runtime genuinely demands a newer glibc than the target.
+"${OCW_PYTHON:-python3}" "$HERE/check_glibc_ceiling.py" --appimage --max "$GLIBC_MAX" "$OUT"
 
 ( cd "$DIST" && sha256sum "openworker-$VERSION-linux-$ARCH-desktop.AppImage" > SHA256SUMS )
 

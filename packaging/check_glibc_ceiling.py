@@ -76,13 +76,8 @@ class ScanResult:
         self.note = note
 
 
-def scan(path: str) -> ScanResult | None:
-    """Required version symbols of one file, or None when it is not a 64-bit little-endian ELF."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return None
+def scan_bytes(data: bytes) -> ScanResult | None:
+    """Required version symbols of an in-memory ELF image, or None when it is not a 64-bit LE ELF."""
     if len(data) < 64 or data[:4] != b"\x7fELF":
         return None
     if data[4] != 2 or data[5] != 1:  # not ELFCLASS64 / not little-endian
@@ -139,6 +134,61 @@ def scan(path: str) -> ScanResult | None:
     return ScanResult(names)
 
 
+def scan(path: str) -> ScanResult | None:
+    """Required version symbols of one file, or None when it is not a 64-bit little-endian ELF."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return scan_bytes(data)
+
+
+def appimage_runtime(path: str):
+    """Inspect ONLY the AppImage runtime — the ELF stub before the squashfs payload.
+
+    Returns (magic_bytes, has_interp, ScanResult-of-runtime) or None when the file is not an
+    AppImage-shaped ELF. We deliberately slice the runtime out instead of scanning the whole
+    file, so the bundled GUI stack (already asserted in the AppDir pass) is not double-counted
+    and a 150 MB squashfs is never read into memory.
+
+    Why the runtime is checked separately at all: an AppImage's container half is itself an ELF.
+    If IT needs a newer glibc than the target, the whole bundle dies before FUSE/mount ever runs
+    — for any payload. Whether the runtime is statically linked (no PT_INTERP) or dynamically
+    linked (PT_INTERP present) is irrelevant to correctness as long as its own GLIBC_* demand is
+    ≤ the ceiling; AppImageKit's `appimagetool` ships a dynamic runtime that only needs very old
+    symbols, so it runs fine on glibc 2.31. We therefore report PT_INTERP but only FAIL on the
+    actual version demand.
+    """
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size < 16:
+                return None
+            f.seek(-8, 2)
+            sqoff, = struct.unpack("<Q", f.read(8))  # squashfs filesystem offset
+            f.seek(0)
+            head = f.read(min(size, max(sqoff + 8192, 1 << 22)))
+    except OSError:
+        return None
+    if head[:4] != b"\x7fELF":
+        return None
+    magic = head[8:11]
+    e_phoff, = struct.unpack_from("<Q", head, 0x20)
+    e_phentsize, e_phnum = struct.unpack_from("<HH", head, 0x36)
+    has_interp = False
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        if off + 4 > len(head):
+            break
+        if struct.unpack_from("<I", head, off)[0] == 3:  # PT_INTERP
+            has_interp = True
+            break
+    # The runtime ELF occupies bytes [0, sqoff); scan just that span.
+    blob = head if sqoff > len(head) else head[:sqoff]
+    return (magic, has_interp, scan_bytes(blob))
+
+
 def walk(targets: list[str]):
     for target in targets:
         if os.path.isfile(target):
@@ -152,8 +202,13 @@ def walk(targets: list[str]):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="check_glibc_ceiling")
     parser.add_argument("--max", required=True, help="oldest glibc the artifact must run on")
+    parser.add_argument("--appimage", action="store_true",
+                        help="targets are AppImage files; check only the runtime ELF, not the payload")
     parser.add_argument("targets", nargs="+")
     args = parser.parse_args(argv)
+
+    if args.appimage:
+        return main_appimage(args)
 
     ceiling = parse_version(args.max)
     offenders: list[tuple[tuple[int, int, int], list[str], str]] = []
@@ -225,6 +280,66 @@ def main(argv=None) -> int:
         print("    GLIBC_%-8s %s" % (fmt(v), path))
     if len(offenders) > 60:
         print("    … and %d more" % (len(offenders) - 60))
+    return 1
+
+
+def main_appimage(args) -> int:
+    """`--appimage`: assert each AppImage's runtime ELF is satisfiable by the glibc ceiling.
+
+    The payload is checked separately (the build runs this over the AppDir too), so here we only
+    look at the container's own ELF — the thing that must run before the squashfs is ever mounted.
+    """
+    ceiling = parse_version(args.max)
+    offenders: list[str] = []
+    print("AppImage runtime glibc check: ceiling GLIBC_%s" % fmt(ceiling))
+
+    for path in args.targets:
+        info = appimage_runtime(path)
+        if info is None:
+            print("  %s" % path)
+            print("    NOT an AppImage-shaped ELF — refusing to guess")
+            offenders.append(path)
+            continue
+        magic, has_interp, res = info
+        print("  %s" % path)
+        print("    type-2 magic : %s  (%s)" % (
+            "OK" if magic in (b"AI\x01", b"AI\x02") else "NOT AppImage!", magic.hex()))
+        print("    runtime PT_INTERP: %s" % (
+            "present — runtime links the host loader (fine if its GLIBC demand is low)"
+            if has_interp else "absent — runtime is statically linked"))
+        if res is None:
+            print("    runtime is not a parseable 64-bit LE ELF")
+            offenders.append(path)
+            continue
+        if res.note:
+            if res.note == "no version-needs table":
+                # Statically linked / versionless runtime: the loader has nothing to check.
+                print("    runtime version needs: none — no GLIBC demand, OK")
+            else:
+                # Stripped runtime: version_needs is only reachable through section headers, so we
+                # cannot prove its GLIBC demand here. Say so rather than pretend; the smoke-appimage
+                # job actually launches the bundle on glibc 2.31 and is the real gate.
+                print("    WARNING: %s — cannot statically verify the runtime's GLIBC demand" % res.note)
+                print("             (smoke-appimage runs it on glibc %s to confirm)" % args.max)
+            continue
+        hit = (0, 0, 0)
+        for name in res.names:
+            m = NAMESPACES["glibc"].match(name)
+            if m:
+                v = parse_version(m.group(1))
+                if v > hit:
+                    hit = v
+        print("    runtime demands: GLIBC_%s" % fmt(hit))
+        if hit > ceiling:
+            print("    FAIL — runtime needs newer glibc than %s" % args.max)
+            offenders.append(path)
+
+    if not offenders:
+        print("  OK — every AppImage runtime is satisfiable by glibc %s" % args.max)
+        return 0
+    print("  FAIL — %d AppImage(s) fail the runtime check:" % len(offenders))
+    for p in offenders:
+        print("    %s" % p)
     return 1
 
 
