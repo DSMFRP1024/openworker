@@ -219,10 +219,17 @@ jobs:
           rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
           apt-get update
+          # Three groups, and the split matters for what this job claims to prove:
+          #   * runtime GUI libs — what a Kylin V10 user would install
+          #   * runtime GL — libgl1-mesa-dri (llvmpipe). Installed explicitly because
+          #     --no-install-recommends skips it, and it is what gives a GPU-less container
+          #     a working GL context for the webview
+          #   * test tooling — curl/binutils/file/xvfb/xdotool/imagemagick, used to inspect
+          #     and drive the app, not to run it
           apt-get install -y --no-install-recommends --allow-downgrades \
-            curl ca-certificates binutils xvfb x11-utils xdotool imagemagick \
+            curl ca-certificates binutils file xvfb x11-utils xdotool imagemagick \
             fonts-dejavu-core dbus dbus-x11 \
-            libwebkit2gtk-4.0-37 libgtk-3-0 libsoup2.4-1
+            libwebkit2gtk-4.0-37 libgtk-3-0 libsoup2.4-1 libgl1-mesa-dri
           # Deliberately NOT installed: libayatana-appindicator3-1. The tray must fail softly
           # and the app must survive it — that is a coded path (lib.rs), so it gets tested
           # rather than assumed.
@@ -277,7 +284,11 @@ jobs:
           # WebKitGTK in a container: no GPU and no usable bubblewrap sandbox.
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          # Two names for the same thing: installs with user namespaces unavailable cannot
+          # start the web process sandbox. WebKitGTK ~2.46 renamed the switch, so set both
+          # rather than guess which of the two this build honours.
           export WEBKIT_FORCE_SANDBOX=0
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
           export LIBGL_ALWAYS_SOFTWARE=1
 
           dbus-run-session -- ./run.sh > app.log 2>&1 &
