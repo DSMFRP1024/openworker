@@ -247,11 +247,25 @@ echo "APPRUN: APPDIR=\$APPDIR" >&2
 echo "APPRUN: WEBKIT_EXEC_PATH=\${WEBKIT_EXEC_PATH:-<unset>}" >&2
 ls -la "\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0" >&2 \
   || echo "APPRUN: helper dir MISSING" >&2
+echo "APPRUN: PWD=\$(pwd)" >&2
+echo "APPRUN: self exe=\$(readlink /proc/self/exe 2>/dev/null || echo '<unreadable>')" >&2
+env | grep -E '^(GTK_|GDK_|GSETTINGS|WEBKIT)' | sed 's/^/APPRUN ENV: /' >&2 || true
+# Run from the AppDir root. This WebKitGTK release derives its helper path from the
+# executable's location rather than honouring WEBKIT_EXEC_PATH, producing a RELATIVE
+# path with no usr/ component; making the AppDir root the working directory gives that
+# derivation its best chance of landing on the bundled helpers.
+cd "\$APPDIR"
 exec "\$APPDIR/usr/bin/openworker-desktop" "\$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"
 rm -f "$APPDIR/AppRun.wrapped"   # linuxdeploy's launcher; we exec the binary ourselves
 ln -sf "usr/share/applications/openworker.desktop" "$APPDIR/openworker.desktop"
+# Belt and braces for the relative helper path above: whatever base WebKit derives,
+# "<base>/lib/<triplet>/webkit2gtk-4.0" has to resolve, and the helpers actually live
+# under usr/lib/<triplet>/webkit2gtk-4.0. Exposing usr/lib as ./lib covers the shape
+# that has no usr/ component. Relative target on purpose - it must keep working after
+# the AppImage is unpacked somewhere else entirely.
+ln -sfn "usr/lib" "$APPDIR/lib"
 
 echo "==> [6/7] glibc ceiling on the AppDir, then appimagetool"
 "${OCW_PYTHON:-python3}" "$HERE/check_glibc_ceiling.py" --max "$GLIBC_MAX" "$APPDIR"
