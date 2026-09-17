@@ -163,12 +163,17 @@ def appimage_runtime(path: str):
     try:
         with open(path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
-            if size < 16:
+            if size < 64:
                 return None
-            f.seek(-8, 2)
-            sqoff, = struct.unpack("<Q", f.read(8))  # squashfs filesystem offset
-            f.seek(0)
-            head = f.read(min(size, max(sqoff + 8192, 1 << 22)))
+            # Read a generous prefix. The AppImageKit runtime ELF sits at offset 0, and its
+            # section-header table (where .gnu.version_r lives) is always well inside the runtime,
+            # which is itself far smaller than 32 MiB. Reading a prefix — instead of trusting the
+            # squashfs-offset trailer, whose exact layout varies between appimagetool builds and
+            # which has historically been mis-decoded as a tiny value — keeps us from ever slicing
+            # the payload or mis-detecting the runtime/payload boundary. scan_bytes() only walks the
+            # runtime's own section headers (reached from the ELF header at offset 0), so the
+            # trailing squashfs bytes are never mistaken for sections.
+            head = f.read(min(size, 32 << 20))
     except OSError:
         return None
     if head[:4] != b"\x7fELF":
@@ -184,9 +189,7 @@ def appimage_runtime(path: str):
         if struct.unpack_from("<I", head, off)[0] == 3:  # PT_INTERP
             has_interp = True
             break
-    # The runtime ELF occupies bytes [0, sqoff); scan just that span.
-    blob = head if sqoff > len(head) else head[:sqoff]
-    return (magic, has_interp, scan_bytes(blob))
+    return (magic, has_interp, scan_bytes(head))
 
 
 def walk(targets: list[str]):
