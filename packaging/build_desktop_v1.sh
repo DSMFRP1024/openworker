@@ -11,11 +11,27 @@
 # Deliberately NOT used here, and both for the same reason:
 #   * the Tauri CLI — @tauri-apps/cli v2 cannot build a v1 app, and pulling the v1 CLI in just
 #     to compile adds a moving part to a build that already has to survive an EOL toolchain;
-#   * Tauri's bundlers — deb/AppImage would drag in linuxdeploy-plugin-gtk, which downloads a
-#     *prebuilt* GTK/WebKit bundle compiled against glibc 2.38, i.e. exactly what we are
-#     avoiding. `bundle.active` is false in src-tauri-v1/tauri.conf.json for that reason.
+#   * Tauri's bundlers — v1's AppImage bundler builds its AppDir out of a *deb* step, so the
+#     sidecar would have to be declared as `resources`, which src-tauri-v1/build.rs exists to
+#     avoid. `bundle.active` is false in src-tauri-v1/tauri.conf.json for that reason.
 # `cargo build --features custom-protocol` is all that is needed: that feature is what embeds
 # ../dist into the binary.
+#
+# THE APPIMAGE IS BUILT ELSEWHERE, on purpose. See build_desktop_v1_appimage.sh, which wraps the
+# tree this script stages. The reason an AppImage can work for a 2.31 target at all — and the
+# correction to a claim this file used to make — is worth stating precisely:
+#
+#   * the AppImage *container* (its type-2 runtime) is statically linked: no PT_INTERP, no
+#     DT_NEEDED, so the host's loader imposes no GLIBC_* check on it. Verified on the shipped
+#     v2 AppImage; the format was never the obstacle.
+#   * what made the v2 AppImage unrunnable on Kylin V10 was its CONTENTS — a libgtk-3.so.0 and
+#     libwebkit2gtk-4.1.so.0 that need GLIBC_2.38.
+#   * those contents are NOT downloaded. linuxdeploy-plugin-gtk resolves every path through the
+#     HOST's pkg-config and copies the HOST's installed packages (checked against the plugin
+#     source: there is no pinned URL or prebuilt tarball in it). The 2.38 came from the
+#     ubuntu-24.04-arm *runner*, not from the plugin.
+#   * therefore bundling inside the bullseye container yields bullseye's GTK3 / WebKitGTK 4.0 —
+#     the same ABI the RHEL-8 family ships. That is the whole trick.
 #
 # Prerequisites: Rust (rustup), Node/npm, and the v1 GUI deps —
 #   libwebkit2gtk-4.0-dev libgtk-3-dev libsoup2.4-dev libjavascriptcoregtk-4.0-dev pkg-config

@@ -17,6 +17,7 @@ on:
     branches: [main]
     paths:
       - "packaging/build_desktop_v1.sh"
+      - "packaging/build_desktop_v1_appimage.sh"
       - "packaging/check_glibc_ceiling.py"
       - "packaging/openworker-server.spec"
       - "surfaces/gui/src-tauri-v1/**"
@@ -70,8 +71,12 @@ jobs:
           # older point release, and libc6-dev/perl pin those versions exactly — so apt
           # otherwise reports "held broken packages" and refuses to install anything.
           want=""
+          # patchelf is what linuxdeploy rewrites rpaths with; dpkg-dev provides
+          # dpkg-architecture, which linuxdeploy-plugin-gtk requires to find the multiarch lib
+          # directory (it aborts outright on Debian without it).
           for pair in git:git curl:curl gcc:build-essential pkg-config:pkg-config \
-                      readelf:binutils tar:tar gzip:gzip xz:xz-utils; do
+                      readelf:binutils tar:tar gzip:gzip xz:xz-utils \
+                      patchelf:patchelf dpkg-architecture:dpkg-dev; do
             command -v "${pair%%:*}" >/dev/null 2>&1 || want="$want ${pair##*:}"
           done
           if [ -n "$want" ]; then
@@ -83,8 +88,12 @@ jobs:
 
       - name: GUI development packages (webkit2gtk-4.0, NOT 4.1)
         run: |
+          # libglib2.0-bin is not optional: linuxdeploy-plugin-gtk runs under `set -e` and calls
+          # `glib-compile-schemas` unguarded, so a missing binary aborts the whole AppImage
+          # bundling step with a message that looks nothing like the cause.
           apt-get install -y --no-install-recommends --allow-downgrades \
-            ${WEBKIT_DEV} libgtk-3-dev libsoup2.4-dev libjavascriptcoregtk-4.0-dev
+            ${WEBKIT_DEV} libgtk-3-dev libsoup2.4-dev libjavascriptcoregtk-4.0-dev \
+            libglib2.0-bin
           rm -rf /var/lib/apt/lists/*
           echo "--- the base this artifact inherits its libc from ---"
           ldd --version | head -1
@@ -188,6 +197,55 @@ jobs:
             exit 1
           fi
           echo "no bundled glibc: OK"
+
+      - name: Build the AppImage from the tree that step just staged
+        env:
+          OCW_PYTHON: python3
+          OCW_GLIBC_MAX: "2.31"
+        run: bash packaging/build_desktop_v1_appimage.sh
+
+      - name: Inspect the AppImage
+        run: |
+          cd packaging/dist-appimage-v1
+          ls -la
+          cat SHA256SUMS
+          APP="$(ls openworker-*.AppImage)"
+          echo "appimage: $APP"
+          # Type-2 magic: bytes 8..11 of a real AppImage are "AI\x02". A renamed ELF would look
+          # perfectly plausible in `ls` and only fail at the worst possible moment.
+          printf 'AI\002' > /tmp/magic.want
+          dd if="$APP" bs=1 skip=8 count=3 2>/dev/null | cmp -s - /tmp/magic.want \
+            || { echo "ERROR: not an AppImage type 2" >&2; exit 1; }
+          echo "type-2 magic: OK"
+          # Extract rather than loopback-mount: the build container has no FUSE. This is only an
+          # inspection step; the assertion that it *runs* happens in smoke-appimage.
+          "./$APP" --appimage-extract >/dev/null
+          echo "--- AppDir top level ---"
+          ls -la squashfs-root
+          echo "--- the two things that decide whether it runs on a machine without WebKitGTK ---"
+          ls -la squashfs-root/usr/lib/libwebkit2gtk-4.0.so.37
+          find squashfs-root -type d -name webkit2gtk-4.0 -exec ls "{}" \;
+          grep -n WEBKIT_EXEC_PATH squashfs-root/AppRun
+          echo "--- the GUI stack it bundles (the reason this variant exists) ---"
+          ls squashfs-root/usr/lib/ | grep -E 'libgtk-3|libgdk-3|libsoup|webkit|javascriptcore'
+          echo "--- it must NOT bundle a libc, or the target's glibc stops mattering ---"
+          if find squashfs-root \( -name 'libc.so.6' -o -name 'ld-linux*' \) | grep -q .; then
+            echo "ERROR: a libc/loader was bundled" >&2
+            exit 1
+          fi
+          echo "no bundled glibc: OK"
+          # Offline proof that the whole tree — including every library linuxdeploy copied out of
+          # bullseye — is still satisfiable by glibc 2.31.
+          python3 ../check_glibc_ceiling.py --max 2.31 squashfs-root
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openworker-linux-arm64-desktop-appimage
+          path: |
+            packaging/dist-appimage-v1/*.AppImage
+            packaging/dist-appimage-v1/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
 
       - uses: actions/upload-artifact@v4
         with:
@@ -372,21 +430,222 @@ jobs:
           find dl -name app.log -exec echo "=== {} ===" \; -exec cat {} \; || true
           cat "$HOME/.config/coworker/logs/openworker-server.log" 2>/dev/null || true
 
+  smoke-appimage:
+    # The claim under test is STRONGER than the tarball's. The tarball needs the user to
+    # `yum install webkit2gtk3`; this AppImage must start on a machine that has no WebKitGTK and
+    # no GTK3 at all. So the test host is a bare Debian 11 with NO GUI packages — and the first
+    # step ASSERTS that, because a smoke test on a host that already has the libraries proves
+    # nothing about the bundle.
+    needs: build-desktop
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:11-slim
+    timeout-minutes: 30
+    steps:
+      - name: Test tooling only — deliberately NOT the GUI libraries
+        run: |
+          printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+          apt-get update
+          # Note what is MISSING on purpose: libwebkit2gtk-4.0-37, libgtk-3-0, libsoup2.4-1.
+          # libgl1 + libgl1-mesa-dri are the one concession: libepoxy dlopens libGL and no
+          # AppImage bundles it (nor does anyone expect one to), and every machine that can
+          # display a window has it.
+          apt-get install -y --no-install-recommends --allow-downgrades \
+            curl ca-certificates binutils file xvfb x11-utils xdotool \
+            fonts-dejavu-core dbus dbus-x11 \
+            libgl1 libgl1-mesa-dri
+          rm -rf /var/lib/apt/lists/*
+          echo "--- glibc of the test host (must be the target's) ---"
+          ldd --version | head -1
+          echo "--- assert the host has no GUI toolkit, or this job proves nothing ---"
+          for lib in libwebkit2gtk libjavascriptcoregtk libgtk-3.so libgdk-3.so libsoup-2.4.so; do
+            if ldconfig -p | grep -q "$lib"; then
+              echo "ERROR: $lib is installed on the test host" >&2
+              exit 1
+            fi
+          done
+          echo "no WebKitGTK and no GTK3 on the host: OK — that is the claim being tested"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64-desktop-appimage
+          path: dl
+
+      - name: Launch the AppImage under Xvfb and assert it comes up
+        run: |
+          # POSIX sh only: this image has no bash, so the runner uses `sh -e` and
+          # `set -o pipefail` would abort on line 1 with "Illegal option".
+          set -eu
+          cd dl
+          APP="$(ls openworker-*.AppImage)"
+          echo "appimage: $APP  ($(du -h "$APP" | cut -f1))"
+          chmod +x "$APP"
+          sha256sum -c SHA256SUMS
+
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1440x1000x24 >/dev/null 2>&1 &
+          xvfb_pid=$!
+          sleep 3
+          export XDG_RUNTIME_DIR=/tmp/xdg
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          # WebKitGTK in a container: no GPU, and no usable bubblewrap sandbox.
+          export WEBKIT_FORCE_SANDBOX=0
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          # A container job has no /dev/fuse, so use the runtime's own extraction path. It runs
+          # the SAME AppDir and the same AppRun that a FUSE-mounted run executes, which is what
+          # makes this evidence about the artifact rather than about the test rig.
+          dbus-run-session -- "./$APP" --appimage-extract-and-run > app.log 2>&1 &
+          app_pid=$!
+          echo "launcher pid: $app_pid"
+
+          LOG="$HOME/.config/coworker/logs/openworker-server.log"
+          for i in $(seq 1 90); do
+            if [ -f "$LOG" ] && grep -q 'Uvicorn running on http' "$LOG" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "--- app stdout/stderr ---"
+          cat app.log || true
+          echo "--- sidecar log ---"
+          cat "$LOG" 2>/dev/null || echo "(no sidecar log — the shell never started it)"
+          [ -f "$LOG" ] || { echo "ERROR: the shell did not start its sidecar" >&2; exit 1; }
+
+          base="$(grep -o 'http://127\.0\.0\.1:[0-9]*' "$LOG" | head -1)"
+          echo "shell chose: $base"
+          [ -n "$base" ]
+
+          echo "--- the bundled server answers on the port the shell picked ---"
+          curl -fsS "$base/v1/health" | tee /tmp/health
+          grep -q '"status": *"ok"' /tmp/health
+
+          echo "--- the GTK window really exists on the display ---"
+          for i in $(seq 1 30); do
+            xdotool search --name OpenWorker >/tmp/wins.txt 2>/dev/null && [ -s /tmp/wins.txt ] && break
+            sleep 1
+          done
+          if [ -s /tmp/wins.txt ]; then
+            echo "window ids: $(tr '\n' ' ' < /tmp/wins.txt)"
+            xwininfo -root -tree | grep -i openworker || true
+            echo "OpenWorker window mapped: OK"
+          else
+            echo "ERROR: no OpenWorker window appeared on the display" >&2
+            xwininfo -root -tree | head -40 || true
+            exit 1
+          fi
+
+          echo "--- the decisive one: did the webview actually RENDER and run JS? ---"
+          # GET /v1/... lines in the server log mean the SPA inside the webview reached the API.
+          # That cannot happen unless libwebkit2gtk found and started WebKitWebProcess — which on
+          # this host can only come from inside the bundle. It is the assertion that separates
+          # "the process started" from "the app works".
+          sleep 5
+          api_hits="$(grep -c 'GET /v1/' "$LOG" || true)"
+          echo "sidecar saw $api_hits API requests from the webview"
+          [ "$api_hits" -gt 0 ] || {
+            echo "ERROR: the webview never called the API — WebKit's helper process most likely" >&2
+            echo "       could not be found. Check WEBKIT_EXEC_PATH in the bundled AppRun, and" >&2
+            echo "       whether usr/lib/<multiarch>/webkit2gtk-4.0 came along." >&2
+            exit 1
+          }
+
+          echo "--- the shell must still be alive ---"
+          kill -0 "$app_pid"
+          if grep -qi 'error while loading shared libraries' app.log; then
+            echo "ERROR: the loader could not resolve a library at runtime" >&2
+            exit 1
+          fi
+          if grep -qiE 'WebKitWebProcess|Failed to start the WebKit|WEBKIT_EXEC_PATH' app.log; then
+            echo "ERROR: WebKit complained about its helper process:" >&2
+            grep -iE 'WebKitWebProcess|Failed to start the WebKit|WEBKIT_EXEC_PATH' app.log >&2
+            exit 1
+          fi
+          echo "still running after startup: OK"
+
+          echo "--- the structural proof: WHICH libwebkit2gtk did it actually map? ---"
+          # The sidecar seeing API requests proves a webview rendered; this says where its engine
+          # came from. If the answer is /usr/lib/... then the host had a WebKitGTK after all and
+          # the run proves nothing — so on this host, "no system WebKit was used" and "the bundle
+          # supplied it" are the same statement, and it is checked rather than assumed.
+          mapped=""
+          for maps in /proc/[0-9]*/maps; do
+            if grep -qa 'libwebkit2gtk' "$maps" 2>/dev/null; then
+              mapped="$(sed -n 's#.*[[:space:]]\(/[^ ]*libwebkit2gtk[^ ]*\)$#\1#p' "$maps" | head -1)"
+              [ -n "$mapped" ] && break
+            fi
+          done
+          echo "mapped: ${mapped:-<none>}"
+          case "$mapped" in
+            /usr/lib/*)
+              echo "ERROR: libwebkit2gtk was loaded from the SYSTEM, not the bundle" >&2
+              exit 1 ;;
+            "")
+              echo "ERROR: nothing mapped libwebkit2gtk — the webview never started" >&2
+              exit 1 ;;
+            *)
+              echo "loaded from inside the bundle: OK" ;;
+          esac
+
+          echo "--- screenshot (evidence, not an assertion) ---"
+          import -window root /tmp/shot.png 2>/dev/null && ls -la /tmp/shot.png || echo "(no screenshot)"
+
+          kill "$app_pid" 2>/dev/null || true
+          sleep 1
+          kill "$xvfb_pid" 2>/dev/null || true
+          echo "SMOKE_OK"
+
+      - name: Screenshot of the running AppImage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openworker-appimage-screenshot
+          path: /tmp/shot.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          find dl -name app.log -exec echo "=== {} ===" \; -exec cat {} \; || true
+          cat "$HOME/.config/coworker/logs/openworker-server.log" 2>/dev/null || true
+
   release:
     # A stable URL beats a per-run artifact: the tag never moves, so
     #   github.com/<owner>/openworker/releases/download/kylin-arm64-desktop/<file>
     # keeps working across rebuilds. Separate from `kylin-arm64` (the browser-served variant) so
     # one can be rebuilt without touching the other.
-    needs: [build-desktop, smoke-desktop]
+    needs: [build-desktop, smoke-desktop, smoke-appimage]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      # Two artifacts, into two directories: each carries its own SHA256SUMS, and dropping both
+      # into one path would have the second silently overwrite the first — leaving a checksum
+      # file that lists one artifact while the release ships two.
       - uses: actions/download-artifact@v4
         with:
           name: openworker-linux-arm64-desktop
-          path: dist
+          path: dl/tarball
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64-desktop-appimage
+          path: dl/appimage
+
+      - name: Merge into one flat directory and one SHA256SUMS
+        run: |
+          mkdir -p dist
+          cp dl/tarball/*.tar.gz dist/
+          cp dl/appimage/*.AppImage dist/
+          ( cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+          ls -la dist
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -396,28 +655,35 @@ jobs:
           make_latest: false
           files: dist/**/*
           body: |
-            **Desktop build of OpenWorker for arm64 Linux distros the normal desktop build
+            **Desktop builds of OpenWorker for arm64 Linux distros the normal desktop build
             cannot target.** Produced by
             [`.github/workflows/kylin-desktop.yml`](../blob/main/.github/workflows/kylin-desktop.yml).
 
             Tested target: **Kylin V10 (aarch64), glibc 2.31** — also Debian 11, Ubuntu 20.04,
             and anything newer that has WebKitGTK 4.0.
 
-            | File | What it is |
-            | --- | --- |
-            | `openworker-*-linux-aarch64-desktop.tar.gz` | The app: unpack anywhere, run `./run.sh`. |
-            | `SHA256SUMS` | Checksum for the file above. |
+            | File | What it is | Needs on the target machine |
+            | --- | --- | --- |
+            | `openworker-*-linux-aarch64-desktop.AppImage` | **Self-contained**, single file: `chmod +x` and run. | Nothing. No package manager, no root, no FUSE\*, no system GUI libraries. |
+            | `openworker-*-linux-aarch64-desktop.tar.gz` | Unpack anywhere, `./run.sh`. | The system GUI libraries (one command, see below). |
+
+            \* AppImage normally loopback-mounts itself, which needs `/dev/fuse`. If your system
+            has no FUSE, add `--appimage-extract-and-run` — the same bundle runs either way.
 
             ```bash
+            chmod +x openworker-*-linux-aarch64-desktop.AppImage
+            ./openworker-*-linux-aarch64-desktop.AppImage          # real GTK window, tray icon
+
+            # or, the tarball
             tar xzf openworker-*-linux-aarch64-desktop.tar.gz
             cd openworker-*-linux-aarch64-desktop
             ./run.sh                      # real GTK window, tray icon
             ./install-menu-entry.sh       # optional: add it to your application menu
             ```
 
-            Install the system GUI libraries first — they are deliberately **not** bundled,
-            because a bundled copy is linked against a newer glibc than yours, which is the
-            failure this build exists to avoid:
+            Install the system GUI libraries **only if you use the tarball**. They are
+            deliberately not bundled in it, because a bundled copy linked against a newer glibc
+            than yours is the failure this build exists to avoid:
 
             ```bash
             # Kylin V10 / RHEL 8 base
@@ -426,27 +692,44 @@ jobs:
             sudo apt install libwebkit2gtk-4.0-37 libgtk-3-0 libsoup2.4-1
             ```
 
-            ### Why this build exists
+            Note the WebKitGTK version in both cases: **4.0, not 4.1**.
+
+            ### Why these builds exist
 
             Tauri **v2** — what the macOS/Windows and generic Linux builds use — requires
             `webkit2gtk-4.1`. The RHEL 8 family ships **4.0** and has no 4.1 in any repository,
             so the v2 desktop shell cannot run on Kylin V10 at all; that is a hard stop, not a
-            packaging problem. This build uses the **Tauri v1** shell
-            (`surfaces/gui/src-tauri-v1`), which links `webkit2gtk-4.0`, and compiles inside
+            packaging problem. These builds use the **Tauri v1** shell
+            (`surfaces/gui/src-tauri-v1`), which links `webkit2gtk-4.0`, and compile inside
             glibc 2.31 so the artifact's floor matches the target exactly.
+
+            ### Why the AppImage can be self-contained when the v2 one could not
+
+            The AppImage *container* was never the problem: its type-2 runtime is statically
+            linked (no `PT_INTERP`, no `DT_NEEDED`), so the host loader imposes no `GLIBC_*`
+            check on it. What made the v2 AppImage unrunnable here was its **contents** — a
+            `libgtk-3.so.0` and `libwebkit2gtk-4.1.so.0` that require glibc 2.38. Those come
+            from wherever the bundler runs, not from a download: `linuxdeploy-plugin-gtk`
+            resolves its paths through the host's own `pkg-config` and copies the host's
+            packages. Bundling inside a Debian 11 container therefore ships Debian 11's GTK3 and
+            WebKitGTK 4.0 — the same ABI the RHEL 8 family has.
 
             ### Verified in CI, by running it
 
             - the artifact's highest glibc requirement is asserted to be ≤ 2.31
-              (`packaging/check_glibc_ceiling.py` fails the build otherwise)
+              (`packaging/check_glibc_ceiling.py` fails the build otherwise), including every
+              library the AppDir picked up
             - `readelf` confirms it links **webkit2gtk-4.0 and not 4.1**, and bundles no glibc
-            - every shared library it needs resolves on a bare Debian 11 with only the system
-              GUI packages (`ldd`, no `not found`)
-            - **it launches under Xvfb** on that same clean container: the GTK window appears on
-              the display, the bundled sidecar comes up on the port the shell picked, and
-              `/v1/health` answers on it
+            - the tarball's every shared library resolves on a bare Debian 11 with only the
+              system GUI packages (`ldd`, no `not found`)
+            - **both artifacts are launched under Xvfb and asserted to work**: the GTK window
+              appears, the bundled sidecar comes up on the port the shell picked, `/v1/health`
+              answers, and the SPA inside the webview reaches the API
+            - the AppImage's smoke test runs on a Debian 11 that has **no WebKitGTK and no GTK3
+              installed at all** — the job asserts their absence before launching, so "it works
+              without them" is a measurement rather than a claim
 
-            ### Not in this build
+            ### Not in these builds
 
             - **Voice input** — the dictation engine is macOS and Windows only.
             - **Auto-update** — Linux artifacts are not in the update manifest; install a newer

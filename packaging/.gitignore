@@ -1,4 +1,10 @@
 /dist
 /build
+# Every variant's build output: dist-v1, dist-v1-bundle, dist-portable-v1, dist-appimage-v1,
+# dist-service, build-v1, build-appimage-v1 ... push_commit.py only skips top-level `dist` and
+# `dl`, so without this a build tree would be committed as if it were source. The leading slash
+# anchors these to packaging/ — they are directory names, not patterns to match anywhere.
+/dist-*
+/build-*
 *.pyc
 __pycache__
