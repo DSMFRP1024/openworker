@@ -2,9 +2,29 @@
 // so the SPA stays a single codebase. We use the injected `window.__TAURI__` global (the shell
 // sets `withGlobalTauri`) instead of the @tauri-apps npm packages, so the browser build needs
 // no Tauri dependencies.
+//
+// Two shells inject that global, and they put `invoke` in different places: Tauri v2 (macOS,
+// Windows, and the 4.1-based Linux build) exposes `__TAURI__.core`, Tauri v1 — the shell used
+// on old-glibc distros, see src-tauri-v1 — exposes the same function as `__TAURI__.tauri`.
+// Reading both is what keeps this ONE frontend build working with either shell.
 
 export const isTauri = (): boolean =>
   typeof (globalThis as any).__TAURI__ !== "undefined";
+
+type InvokeFn = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+/** Tauri v2's `__TAURI__.core.invoke`, else Tauri v1's `__TAURI__.tauri.invoke`, else null.
+ * Wrapped rather than returned by reference so the receiver is preserved on both shells. */
+const tauriInvoke = (): InvokeFn | null => {
+  const tauri = (globalThis as any).__TAURI__;
+  if (typeof tauri?.core?.invoke === "function") {
+    return (cmd, args) => tauri.core.invoke(cmd, args);
+  }
+  if (typeof tauri?.tauri?.invoke === "function") {
+    return (cmd, args) => tauri.tauri.invoke(cmd, args);
+  }
+  return null;
+};
 
 // "macos" | "windows" | "linux" — injected by the shell (std::env::consts::OS) before the
 // SPA loads; userAgent fallback covers browser dev. The macOS overlay-titlebar layout (and
@@ -35,19 +55,19 @@ export type DictationDownloadProgress = {
 };
 
 const invoke = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> => {
-  const tauri = (globalThis as any).__TAURI__;
-  if (!tauri?.core?.invoke) return null;
+  const call = tauriInvoke();
+  if (!call) return null;
   try {
-    return (await tauri.core.invoke(cmd, args)) as T;
+    return (await call(cmd, args)) as T;
   } catch {
     return null;
   }
 };
 
 const invokeStrict = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
-  const tauri = (globalThis as any).__TAURI__;
-  if (!tauri?.core?.invoke) throw new Error("This feature is available in the desktop app.");
-  return (await tauri.core.invoke(cmd, args)) as T;
+  const call = tauriInvoke();
+  if (!call) throw new Error("This feature is available in the desktop app.");
+  return (await call(cmd, args)) as T;
 };
 
 /** Open the native macOS folder picker (Tauri only). Returns the chosen path, or null. */

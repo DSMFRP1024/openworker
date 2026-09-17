@@ -1,0 +1,446 @@
+name: Kylin arm64 desktop (Tauri v1)
+
+# Builds the **desktop** app for distros the Tauri v2 shell cannot target — Kylin V10 and
+# anything else on the RHEL 8 base. The reason is a single package name:
+#
+#   Tauri v2 -> webkit2gtk-4.1   (RHEL 8 family ships only 4.0; 4.1 does not exist there)
+#   Tauri v1 -> webkit2gtk-4.0   (present, and building on bullseye pins glibc to 2.31)
+#
+# So this workflow builds surfaces/gui/src-tauri-v1 inside python:3.11-bullseye (glibc 2.31,
+# the same as Kylin V10) instead of on the runner's Ubuntu 24.04 host, and then — unlike the
+# browser-served variant — it can do something better than static assertions: it LAUNCHES the
+# real GUI under Xvfb on a bare Debian 11 with only the system WebKitGTK/GTK, and asserts that
+# the window appears and the bundled sidecar answers on the port the shell picked.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/build_desktop_v1.sh"
+      - "packaging/check_glibc_ceiling.py"
+      - "packaging/openworker-server.spec"
+      - "surfaces/gui/src-tauri-v1/**"
+      - "surfaces/gui/src/**"
+      - "surfaces/gui/index.html"
+      - "surfaces/gui/package.json"
+      - "surfaces/gui/package-lock.json"
+      - "surfaces/gui/vite.config.ts"
+      - "coworker/**"
+      - ".github/workflows/kylin-desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # glibc 2.31 == Kylin V10 aarch64 == Debian 11. The build image sets the artifact's floor.
+  BUILD_IMAGE: python:3.11-bullseye
+  SMOKE_IMAGE: debian:11-slim
+  # Tauri v1's runtime dependency, and the one Debian release that has it AND glibc 2.31.
+  WEBKIT_DEV: libwebkit2gtk-4.0-dev
+  NODE_CHANNEL: latest-v20.x
+
+jobs:
+  build-desktop:
+    # Native arm64: PyInstaller cannot cross-compile, so an x86 runner could only produce an
+    # x86 sidecar. ubuntu-24.04-arm is free for public repos.
+    runs-on: ubuntu-24.04-arm
+    container:
+      # The FULL image, not -slim: buildpack-deps already carries git, curl, a compiler and
+      # ca-certificates, which keeps the archive's frozen point release from having to satisfy
+      # a dependency web.
+      image: python:3.11-bullseye
+    timeout-minutes: 150
+    steps:
+      # Before checkout: in a container job the action runs inside the container, so git has
+      # to exist first.
+      - name: Tooling (git, curl, compilers, pkg-config, binutils)
+        run: |
+          # Debian 11 is past LTS and its security suite is gone from EVERY mirror: the pool
+          # 404s on deb.debian.org, and archive.debian.org carries no bullseye-security Release
+          # file at all. Point apt at the archive (the frozen final state of the release —
+          # exactly what we want to build against) with the security suite dropped, and stop
+          # demanding a valid-until date on its expired Release file.
+          printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+          apt-get update
+          # --allow-downgrades is the part that matters: the image carries security-updated
+          # libc6/perl-base from when it was built, while the archive's frozen main is the
+          # older point release, and libc6-dev/perl pin those versions exactly — so apt
+          # otherwise reports "held broken packages" and refuses to install anything.
+          want=""
+          for pair in git:git curl:curl gcc:build-essential pkg-config:pkg-config \
+                      readelf:binutils tar:tar gzip:gzip xz:xz-utils; do
+            command -v "${pair%%:*}" >/dev/null 2>&1 || want="$want ${pair##*:}"
+          done
+          if [ -n "$want" ]; then
+            echo "installing:$want"
+            apt-get install -y --no-install-recommends --allow-downgrades $want
+          else
+            echo "nothing to install — the image already provides the tooling"
+          fi
+
+      - name: GUI development packages (webkit2gtk-4.0, NOT 4.1)
+        run: |
+          apt-get install -y --no-install-recommends --allow-downgrades \
+            ${WEBKIT_DEV} libgtk-3-dev libsoup2.4-dev libjavascriptcoregtk-4.0-dev
+          rm -rf /var/lib/apt/lists/*
+          echo "--- the base this artifact inherits its libc from ---"
+          ldd --version | head -1
+          echo "--- the WebKitGTK generation this shell links against ---"
+          pkg-config --modversion webkit2gtk-4.0
+          echo "4.0 present. And the v2 blocker, for the record:"
+          if pkg-config --exists webkit2gtk-4.1; then
+            echo "  UNEXPECTED: webkit2gtk-4.1 is present in bullseye" >&2
+            exit 1
+          fi
+          echo "  webkit2gtk-4.1: absent (this is why the v2 shell is impossible here)"
+          pkg-config --modversion gtk+-3.0
+
+      - uses: actions/checkout@v4
+
+      - name: Node.js (for the GUI build)
+        run: |
+          BASE="https://nodejs.org/dist/${NODE_CHANNEL}"
+          # Resolve the exact filename from the channel index instead of pinning a version
+          # that will eventually 404.
+          FILE="$(curl -fsSL "$BASE/" | grep -o 'node-v[0-9.]*-linux-arm64\.tar\.gz' | head -1)"
+          echo "installing $FILE"
+          curl -fsSL "$BASE/$FILE" -o /tmp/node.tar.gz
+          tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1
+          rm /tmp/node.tar.gz
+          node --version
+          npm --version
+
+      - name: Rust (rustup, stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          # Persist for the following steps; `$HOME/.cargo/env` only affects this shell.
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" -vV
+
+      - name: Sidecar venv (matches build_linux.sh's expectations)
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          # typer is build-time only: PyInstaller walks `mcp`, whose CLI module calls
+          # sys.exit() at import when typer is missing, which aborts the freeze.
+          .venv/bin/python -m pip install -e '.[bedrock]' pyinstaller typer tzdata
+
+      - name: npm ci
+        working-directory: surfaces/gui
+        run: npm ci
+
+      - name: Build the desktop bundle
+        env:
+          OCW_PYTHON: python3
+          OCW_GLIBC_MAX: "2.31"
+        run: bash packaging/build_desktop_v1.sh
+
+      - name: Inspect the bundle
+        run: |
+          cd packaging/dist-v1-bundle
+          tar tzf openworker-*-desktop.tar.gz > /tmp/list.txt
+          echo "entries: $(wc -l < /tmp/list.txt)"
+          echo "--- top level ---"
+          sed -n 's|^[^/]*/\([^/]*\).*|\1|p' /tmp/list.txt | sort -u | head -20
+          echo "--- launcher / executable / sidecar ---"
+          grep -E 'run\.sh$|install-menu-entry\.sh$|/openworker-desktop$|README\.txt$|/sidecar/openworker-server$' /tmp/list.txt
+          echo "--- sidecar files ---"
+          grep -c '/sidecar/' /tmp/list.txt
+          echo "--- sizes ---"
+          ls -la openworker-*-desktop.tar.gz
+          cat SHA256SUMS
+          # Guard the claim in README.txt: this variant deliberately ships NO bundled GUI stack,
+          # so a bundled webkit/gtk would mean the build silently changed shape.
+          if grep -qE '/sidecar/(libwebkit|libgtk)|/(web)/' /tmp/list.txt; then
+            echo "ERROR: unexpected bundled GUI/web artifacts" >&2
+            exit 1
+          fi
+
+      - name: Assert the tarball is complete and the layout is the one the shell expects
+        run: |
+          cd packaging/dist-v1-bundle
+          mkdir -p /tmp/verify && tar xzf openworker-*-desktop.tar.gz -C /tmp/verify
+          cd /tmp/verify/openworker-*-desktop
+          test -x openworker-desktop
+          test -x run.sh
+          test -x install-menu-entry.sh
+          test -x sidecar/openworker-server
+          # `server_bin()` looks for <exe dir>/sidecar/openworker-server first.
+          test -f sidecar/openworker-server
+          file openworker-desktop
+          file openworker-desktop | grep -q 'ARM aarch64'
+          # The ABI decision, asserted on the artifact rather than trusted:
+          readelf -d openworker-desktop | grep NEEDED
+          if readelf -d openworker-desktop | grep -q 'libwebkit2gtk-4\.1'; then
+            echo "ERROR: the shipped binary links webkit2gtk-4.1" >&2
+            exit 1
+          fi
+          readelf -d openworker-desktop | grep -q 'libwebkit2gtk-4\.0\.so'
+          echo "links webkit2gtk-4.0 only: OK"
+          # No libc inside, so the host's glibc is used — which the ceiling check just proved is
+          # good enough.
+          if find . -name 'libc.so.6' -o -name 'ld-linux*' | grep -q .; then
+            echo "ERROR: a libc/loader was bundled" >&2
+            exit 1
+          fi
+          echo "no bundled glibc: OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openworker-linux-arm64-desktop
+          path: |
+            packaging/dist-v1-bundle/*.tar.gz
+            packaging/dist-v1-bundle/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke-desktop:
+    # The claim under test: "it starts on a glibc 2.31 machine that has nothing but the system
+    # WebKitGTK/GTK". So the test host is a bare Debian 11 with no Python, no compiler, and the
+    # *runtime* GUI libraries only — no -dev packages.
+    #
+    # This job goes further than the browser-served smoke test can: the app is a real GTK
+    # window over a real WebKit2GTK webview, so it is launched under Xvfb and the window is
+    # looked for on the display. A binary that merely links is not evidence that it runs.
+    needs: build-desktop
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:11-slim
+    timeout-minutes: 30
+    steps:
+      - name: Runtime GUI libraries + a headless display
+        run: |
+          # Same Debian 11 archive move as the build job — see the comment there.
+          printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+          apt-get update
+          apt-get install -y --no-install-recommends --allow-downgrades \
+            curl ca-certificates binutils xvfb x11-utils xdotool imagemagick \
+            fonts-dejavu-core dbus dbus-x11 \
+            libwebkit2gtk-4.0-37 libgtk-3-0 libsoup2.4-1
+          # Deliberately NOT installed: libayatana-appindicator3-1. The tray must fail softly
+          # and the app must survive it — that is a coded path (lib.rs), so it gets tested
+          # rather than assumed.
+          rm -rf /var/lib/apt/lists/*
+          echo "--- glibc of the test host ---"
+          ldd --version | head -1
+          echo "--- and it really has no Python to fall back on ---"
+          if command -v python3 >/dev/null || command -v python >/dev/null; then
+            echo "ERROR: a Python is installed here, so this cannot prove self-containment" >&2
+            exit 1
+          fi
+          echo "no python on the host: OK (the frozen runtime must carry itself)"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64-desktop
+          path: dl
+
+      - name: Unpack, then check every shared library it needs is actually resolvable here
+        run: |
+          # POSIX sh only, deliberately: this image has no bash, so the runner executes the
+          # step with `sh -e`, and `set -o pipefail` would abort it on line 1 with
+          # "Illegal option -o pipefail". The tarball's own run.sh is POSIX too.
+          set -eu
+          cd dl
+          tar xzf openworker-*-desktop.tar.gz
+          cd openworker-*-desktop
+          echo "--- dynamic dependencies of the shell ---"
+          readelf -d openworker-desktop | grep NEEDED
+          echo "--- can the loader resolve all of them? (missing ones would print 'not found') ---"
+          ldd openworker-desktop | tee /tmp/ldd.txt
+          if grep -q 'not found' /tmp/ldd.txt; then
+            echo "ERROR: unresolvable shared libraries — the tarball needs more than the system GUI stack" >&2
+            exit 1
+          fi
+          echo "all shared libraries resolved by the system packages alone: OK"
+          echo "--- the bundled sidecar is a self-contained runtime, not a script ---"
+          file sidecar/openworker-server
+          file sidecar/openworker-server | grep -q 'ARM aarch64'
+
+      - name: Launch the GUI under Xvfb and assert it comes up
+        run: |
+          set -eu
+          cd dl/openworker-*-desktop
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1440x1000x24 >/dev/null 2>&1 &
+          xvfb_pid=$!
+          sleep 3
+          export XDG_RUNTIME_DIR=/tmp/xdg
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          # WebKitGTK in a container: no GPU and no usable bubblewrap sandbox.
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export WEBKIT_FORCE_SANDBOX=0
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          dbus-run-session -- ./run.sh > app.log 2>&1 &
+          app_pid=$!
+          echo "launcher pid: $app_pid"
+
+          # The shell picks a random free port and starts the sidecar on it; the sidecar's log
+          # is therefore the only place that port appears.
+          LOG="$HOME/.config/coworker/logs/openworker-server.log"
+          for i in $(seq 1 90); do
+            if [ -f "$LOG" ] && grep -q 'Uvicorn running on http' "$LOG" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "--- app stdout/stderr ---"
+          cat app.log || true
+          echo "--- sidecar log ---"
+          cat "$LOG" 2>/dev/null || echo "(no sidecar log — the shell never started it)"
+          [ -f "$LOG" ] || { echo "ERROR: the shell did not start its sidecar" >&2; exit 1; }
+
+          base="$(grep -o 'http://127\.0\.0\.1:[0-9]*' "$LOG" | head -1)"
+          echo "shell chose: $base"
+          [ -n "$base" ]
+
+          echo "--- the bundled server answers on the port the shell picked ---"
+          curl -fsS "$base/v1/health" | tee /tmp/health
+          grep -q '"status": *"ok"' /tmp/health
+
+          echo "--- the GTK window really exists on the display ---"
+          for i in $(seq 1 30); do
+            xdotool search --name OpenWorker >/tmp/wins.txt 2>/dev/null && [ -s /tmp/wins.txt ] && break
+            sleep 1
+          done
+          if [ -s /tmp/wins.txt ]; then
+            echo "window ids: $(cat /tmp/wins.txt | tr '\n' ' ')"
+            xwininfo -root -tree | grep -i openworker || true
+            echo "OpenWorker window mapped: OK"
+          else
+            echo "ERROR: no OpenWorker window appeared on the display" >&2
+            xwininfo -root -tree | head -40 || true
+            exit 1
+          fi
+
+          echo "--- the shell must still be alive (no crashed webview, no missing library) ---"
+          sleep 5
+          kill -0 "$app_pid"
+          if grep -qi 'error while loading shared libraries' app.log; then
+            echo "ERROR: the loader could not resolve a library at runtime" >&2
+            exit 1
+          fi
+          echo "still running after startup: OK"
+
+          echo "--- tray behaved as coded (no appindicator installed here) ---"
+          grep -i 'system tray' app.log || echo "(no tray message — the tray was created successfully)"
+
+          echo "--- did the SPA in the webview reach the API? ---"
+          grep -c 'GET /v1/' "$LOG" || true
+
+          echo "--- screenshot (evidence, not an assertion) ---"
+          import -window root /tmp/shot.png 2>/dev/null && ls -la /tmp/shot.png || echo "(no screenshot)"
+
+          kill "$app_pid" 2>/dev/null || true
+          sleep 1
+          kill "$xvfb_pid" 2>/dev/null || true
+          echo "SMOKE_OK"
+
+      - name: Screenshot of the running app
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openworker-desktop-screenshot
+          path: /tmp/shot.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: App and server logs on failure
+        if: failure()
+        run: |
+          find dl -name app.log -exec echo "=== {} ===" \; -exec cat {} \; || true
+          cat "$HOME/.config/coworker/logs/openworker-server.log" 2>/dev/null || true
+
+  release:
+    # A stable URL beats a per-run artifact: the tag never moves, so
+    #   github.com/<owner>/openworker/releases/download/kylin-arm64-desktop/<file>
+    # keeps working across rebuilds. Separate from `kylin-arm64` (the browser-served variant) so
+    # one can be rebuilt without touching the other.
+    needs: [build-desktop, smoke-desktop]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64-desktop
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kylin-arm64-desktop
+          name: OpenWorker for Linux arm64, desktop app (Kylin V10 / glibc 2.31)
+          prerelease: false
+          make_latest: false
+          files: dist/**/*
+          body: |
+            **Desktop build of OpenWorker for arm64 Linux distros the normal desktop build
+            cannot target.** Produced by
+            [`.github/workflows/kylin-desktop.yml`](../blob/main/.github/workflows/kylin-desktop.yml).
+
+            Tested target: **Kylin V10 (aarch64), glibc 2.31** — also Debian 11, Ubuntu 20.04,
+            and anything newer that has WebKitGTK 4.0.
+
+            | File | What it is |
+            | --- | --- |
+            | `openworker-*-linux-aarch64-desktop.tar.gz` | The app: unpack anywhere, run `./run.sh`. |
+            | `SHA256SUMS` | Checksum for the file above. |
+
+            ```bash
+            tar xzf openworker-*-linux-aarch64-desktop.tar.gz
+            cd openworker-*-linux-aarch64-desktop
+            ./run.sh                      # real GTK window, tray icon
+            ./install-menu-entry.sh       # optional: add it to your application menu
+            ```
+
+            Install the system GUI libraries first — they are deliberately **not** bundled,
+            because a bundled copy is linked against a newer glibc than yours, which is the
+            failure this build exists to avoid:
+
+            ```bash
+            # Kylin V10 / RHEL 8 base
+            sudo yum install webkit2gtk3 gtk3 libsoup
+            # Debian / Ubuntu
+            sudo apt install libwebkit2gtk-4.0-37 libgtk-3-0 libsoup2.4-1
+            ```
+
+            ### Why this build exists
+
+            Tauri **v2** — what the macOS/Windows and generic Linux builds use — requires
+            `webkit2gtk-4.1`. The RHEL 8 family ships **4.0** and has no 4.1 in any repository,
+            so the v2 desktop shell cannot run on Kylin V10 at all; that is a hard stop, not a
+            packaging problem. This build uses the **Tauri v1** shell
+            (`surfaces/gui/src-tauri-v1`), which links `webkit2gtk-4.0`, and compiles inside
+            glibc 2.31 so the artifact's floor matches the target exactly.
+
+            ### Verified in CI, by running it
+
+            - the artifact's highest glibc requirement is asserted to be ≤ 2.31
+              (`packaging/check_glibc_ceiling.py` fails the build otherwise)
+            - `readelf` confirms it links **webkit2gtk-4.0 and not 4.1**, and bundles no glibc
+            - every shared library it needs resolves on a bare Debian 11 with only the system
+              GUI packages (`ldd`, no `not found`)
+            - **it launches under Xvfb** on that same clean container: the GTK window appears on
+              the display, the bundled sidecar comes up on the port the shell picked, and
+              `/v1/health` answers on it
+
+            ### Not in this build
+
+            - **Voice input** — the dictation engine is macOS and Windows only.
+            - **Auto-update** — Linux artifacts are not in the update manifest; install a newer
+              tarball over this one instead.
+
+            The tray needs `libayatana-appindicator3` (or the older `libappindicator3`) at
+            runtime. Without it the app starts and works normally; it just loses the tray icon,
+            and closing the window quits instead of hiding to the tray.

@@ -1,0 +1,42 @@
+# OpenWorker desktop shell built on Tauri **v1**.
+#
+# Why this crate exists next to ../src-tauri (Tauri v2): the dependency floor. Tauri v2
+# hard-requires `webkit2gtk-4.1`, which the entire RHEL 8 family — and therefore Kylin V10 /
+# UOS 20 — does not ship and cannot install (bullseye, the closest glibc-2.31 distro, has
+# `libwebkit2gtk-4.0-dev` and specifically *not* `-4.1-dev`). Tauri v1 links against 4.0, so
+# this is the one desktop shell that can run on those machines. See README.md.
+#
+# Nothing here is shared with the v2 crate on purpose: keeping them separate means the
+# macOS/Windows builds keep using the upstream shell untouched.
+[package]
+name = "openworker-desktop-v1"
+version = "0.2.1"
+description = "OpenWorker desktop shell (Tauri v1) for old-glibc distros"
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+name = "openworker_desktop_v1_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+# `dialog`: the file picker, built into v1 (there is no v1 `tauri-plugin-dialog` — the plugin
+#   crates only exist from 2.x, i.e. they target Tauri v2).
+# `icon-png`: lets the tray use Icon::Raw on the PNG we embed.
+# `system-tray`: the close-to-tray behaviour. Best-effort at runtime — see lib.rs.
+tauri = { version = "1.8", features = ["dialog", "icon-png", "system-tray"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+# Only to ask "would the tray's runtime dlopen succeed?" before the tray is created — see
+# `appindicator_available()` in lib.rs. No new build cost: libappindicator-sys (pulled in by
+# tao's tray feature) depends on the same version.
+libloading = "0.7"
+
+[features]
+# Embeds the frontend into the binary. `tauri build` normally adds it; we compile with plain
+# cargo (no Tauri CLI, no bundler) so build_desktop_v1.sh passes it explicitly.
+custom-protocol = ["tauri/custom-protocol"]
