@@ -73,10 +73,12 @@ jobs:
           want=""
           # patchelf is what linuxdeploy rewrites rpaths with; dpkg-dev provides
           # dpkg-architecture, which linuxdeploy-plugin-gtk requires to find the multiarch lib
-          # directory (it aborts outright on Debian without it).
+          # directory (it aborts outright on Debian without it). squashfs-tools backs
+          # appimagetool's mksquashfs, which it normally carries inside itself — cheap insurance
+          # against a failure mode that reads like a corrupt AppDir.
           for pair in git:git curl:curl gcc:build-essential pkg-config:pkg-config \
                       readelf:binutils tar:tar gzip:gzip xz:xz-utils \
-                      patchelf:patchelf dpkg-architecture:dpkg-dev; do
+                      patchelf:patchelf dpkg-architecture:dpkg-dev mksquashfs:squashfs-tools; do
             command -v "${pair%%:*}" >/dev/null 2>&1 || want="$want ${pair##*:}"
           done
           if [ -n "$want" ]; then
@@ -448,14 +450,25 @@ jobs:
           rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
           apt-get update
-          # Note what is MISSING on purpose: libwebkit2gtk-4.0-37, libgtk-3-0, libsoup2.4-1.
-          # libgl1 + libgl1-mesa-dri are the one concession: libepoxy dlopens libGL and no
-          # AppImage bundles it (nor does anyone expect one to), and every machine that can
-          # display a window has it.
+          # Three groups, and the split is the whole point of this job.
+          #
+          # 1. test tooling: xvfb/xdotool/x11-utils drive and inspect the app, imagemagick takes
+          #    the screenshot.
+          # 2. the CORE DESKTOP BASELINE — libX11, fontconfig/freetype/expat, libGL/EGL. These are
+          #    NOT bundled by linuxdeploy, and deliberately so: it applies the AppImage project's
+          #    excludelist, which skips libraries considered too fundamental to ship (a bundled
+          #    libX11 or fontconfig would fight the host's own). Verified rather than assumed —
+          #    the existing v2 AppImage bundles libXext.so.6 but no libX11.so.6, libfontconfig.so.1,
+          #    libfreetype.so.6, libexpat.so.1 or libGL.so.1. Every machine that can open a window
+          #    has these, so installing them does not weaken the claim below.
+          # 3. NOT installed, and this is the claim: libwebkit2gtk-4.0-37, libgtk-3-0, libsoup2.4-1,
+          #    libjavascriptcoregtk-4.0-37. The assertion after this install proves their absence —
+          #    if any of them leaked in, this job stops instead of reporting a meaningless pass.
           apt-get install -y --no-install-recommends --allow-downgrades \
-            curl ca-certificates binutils file xvfb x11-utils xdotool \
+            curl ca-certificates binutils file xvfb x11-utils xdotool imagemagick \
             fonts-dejavu-core dbus dbus-x11 \
-            libgl1 libgl1-mesa-dri
+            libx11-6 libfontconfig1 libfreetype6 libexpat1 \
+            libgl1 libgl1-mesa-dri libglx-mesa0 libegl1
           rm -rf /var/lib/apt/lists/*
           echo "--- glibc of the test host (must be the target's) ---"
           ldd --version | head -1
@@ -664,11 +677,16 @@ jobs:
 
             | File | What it is | Needs on the target machine |
             | --- | --- | --- |
-            | `openworker-*-linux-aarch64-desktop.AppImage` | **Self-contained**, single file: `chmod +x` and run. | Nothing. No package manager, no root, no FUSE\*, no system GUI libraries. |
+            | `openworker-*-linux-aarch64-desktop.AppImage` | **Self-contained**, single file: `chmod +x` and run. | No package manager, no root, no FUSE\*, and **no GUI toolkit** — it carries its own GTK3 and WebKitGTK 4.0. Only the core X11 / font / GL libraries that every graphical machine already has. |
             | `openworker-*-linux-aarch64-desktop.tar.gz` | Unpack anywhere, `./run.sh`. | The system GUI libraries (one command, see below). |
 
             \* AppImage normally loopback-mounts itself, which needs `/dev/fuse`. If your system
             has no FUSE, add `--appimage-extract-and-run` — the same bundle runs either way.
+
+            The AppImage not bundling `libX11`, `libfontconfig`, `libfreetype` or `libGL` is not
+            an oversight: the AppImage tooling applies its project's excludelist, which skips
+            libraries considered too fundamental to ship, because a bundled copy would fight the
+            host's own. It is the one thing to know about the format.
 
             ```bash
             chmod +x openworker-*-linux-aarch64-desktop.AppImage
@@ -727,7 +745,9 @@ jobs:
               answers, and the SPA inside the webview reaches the API
             - the AppImage's smoke test runs on a Debian 11 that has **no WebKitGTK and no GTK3
               installed at all** — the job asserts their absence before launching, so "it works
-              without them" is a measurement rather than a claim
+              without them" is a measurement rather than a claim. It then reads
+              `/proc/<pid>/maps` to confirm the running webview loaded `libwebkit2gtk` from
+              inside the bundle rather than from the host.
 
             ### Not in these builds
 

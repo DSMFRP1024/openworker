@@ -91,7 +91,10 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 
 echo "==> [2/7] assembling the AppDir from the staged tree"
 rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" \
+# usr/lib/OpenWorker has to exist before the sidecar copy: `cp -R src a/b/c` creates only the
+# last component, so a missing parent fails with "No such file or directory" on the destination.
+mkdir -p "$APPDIR/usr/bin" \
+         "$APPDIR/usr/lib/OpenWorker" \
          "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/128x128/apps" \
          "$APPDIR/usr/share/doc/openworker"
