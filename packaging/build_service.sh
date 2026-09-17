@@ -80,19 +80,22 @@ chmod +x "$STAGE/sidecar/openworker-service"
 cp -RL "$GUI/dist/." "$STAGE/web/"
 
 cat > "$STAGE/run.sh" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/sh
 # Start OpenWorker and open the printed URL in a browser.
 #
-#   ./run.sh                      # 127.0.0.1:8765
-#   ./run.sh --port 8899          # different port
+#   ./run.sh                         # 127.0.0.1:8765
+#   ./run.sh --port 8899             # different port
 #   COWORKER_HOST=0.0.0.0 ./run.sh   # reachable from other machines (see README security note)
-set -euo pipefail
+#
+# POSIX sh, not bash: a minimal Debian/Ubuntu container has no bash, and this launcher has to
+# work wherever the tarball is unpacked.
+set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export COWORKER_WEB_DIR="${COWORKER_WEB_DIR:-$HERE/web}"
 exec "$HERE/sidecar/openworker-service" \
   --host "${COWORKER_HOST:-127.0.0.1}" \
   --port "${COWORKER_PORT:-8765}" \
-  --web "$COWORKER_WEB_DIR" "$@"
+  --web "$COWORKER_WEB_DIR" ${@+"$@"}   # idiom: pass "$@" verbatim under `set -u`
 EOF
 chmod +x "$STAGE/run.sh"
 

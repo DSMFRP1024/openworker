@@ -189,14 +189,22 @@ jobs:
 
       - name: Start, then assert the API, the GUI and the token gate
         run: |
-          set -euo pipefail
-          cd dl && tar xzf openworker-*-service.tar.gz && cd openworker-*-service
+          # POSIX sh only, deliberately: this image has no bash, so the runner executes the
+          # step with `sh -e`, and `set -o pipefail` would abort it on line 1 with
+          # "Illegal option -o pipefail" — which is exactly how this step failed the first
+          # time. The tarball's own run.sh is POSIX too, for the same reason.
+          set -eu
+          cd dl
+          tar xzf openworker-*-service.tar.gz
+          cd openworker-*-service
           ./run.sh --port 8899 > server.log 2>&1 &
-          echo "--- startup banner ---"
+          pid=$!
+          echo "server pid: $pid"
           for i in $(seq 1 60); do
             grep -q 'OpenWorker service mode' server.log 2>/dev/null && break
             sleep 1
           done
+          echo "--- startup banner ---"
           cat server.log
 
           base=http://127.0.0.1:8899
@@ -220,7 +228,7 @@ jobs:
           curl -fsS "$base/${asset#./}" -o asset.js
           test -s asset.js
           grep -q 'X-OpenWorker-Token' asset.js
-          echo "GUI asset served and it is the module that sends the token header: OK"
+          echo "GUI asset served, and it is the module that sends the token header: OK"
 
           echo "--- auth gate ---"
           token="$(cat "$HOME/.config/coworker/sidecar-8899.token")"
@@ -230,12 +238,12 @@ jobs:
           [ "$no" = "401" ]
           [ "$yes" = "200" ]
 
-          echo "--- unknown path is not silently index.html ---"
+          echo "--- unknown path must not silently serve the GUI ---"
           unknown="$(curl -s -o /dev/null -w '%{http_code}' "$base/nope")"
           echo "GET /nope -> $unknown"
           [ "$unknown" = "404" ]
 
-          kill %1 2>/dev/null || true
+          kill "$pid" 2>/dev/null || true
           echo "SMOKE_OK"
 
       - name: Server log on failure
