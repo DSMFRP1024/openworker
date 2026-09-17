@@ -18,10 +18,10 @@
       "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png"]
     },
     "allowlist": {
-      "all": false,
-      "event": {
-        "all": true
-      }
+      "all": false
+    },
+    "systemTray": {
+      "iconPath": "icons/tray.png"
     },
     "windows": [],
     "security": {

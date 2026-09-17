@@ -60,6 +60,36 @@ creation in `catch_unwind` as a second line of defence. Without the library the 
 normally, loses only the tray icon, and closing the window quits instead of hiding to the tray
 — which is the other half of the fix: a hidden window with no tray is an unreachable window.
 
+## Two v1 config traps that cost a CI cycle each
+
+`tauri.conf.json` here is **v1 schema**, and it differs from the v2 one next door in two ways
+that fail the build rather than degrade quietly. Both were hit for real.
+
+1. **There is no `allowlist.event` in v1.** The valid allowlist keys are `all`, `fs`, `window`,
+   `shell`, `dialog`, `http`, `notification`, `global-shortcut`, `os`, `path`, `protocol`,
+   `process`, `clipboard`, `app` — the event API is core, not allowlisted (which is why
+   `__TAURI__.event.listen` is always injected). Carrying v2's `core:event:*` idea over as
+   `"event": {"all": true}` makes `tauri-build` fail with
+   `unknown field 'event', expected one of ...`.
+
+2. **`tauri-build` cross-checks the `tauri` Cargo features against this file** — not only the
+   allowlist, but every feature in `TauriConfig::all_features()`, which also contains `cli`,
+   `updater`, **`system-tray`**, `macos-private-api` and `isolation`. The check compares the
+   `tauri` dependency's features in `Cargo.toml` (filtered to that set) against what the config
+   implies, and errors on any difference. Since `system-tray` is enabled in `Cargo.toml`, the
+   config must justify it by declaring a `systemTray` section — otherwise:
+   `The 'tauri' dependency features on the 'Cargo.toml' file does not match the allowlist`.
+
+   Declaring it is harmless, and that is worth stating because the tray is the thing this shell
+   is most careful about: `systemTray` does **not** create a tray. It only supplies a default
+   icon for one built explicitly (`Context::system_tray_icon`, read by `SystemTray::build` when
+   no icon was set) and a `cargo:rerun-if-changed` line. Nothing touches appindicator, so the
+   probe in `lib.rs` still runs first. `iconPath` is required by the schema.
+
+Bare `dialog` needs no allowlist entry: it is the feature that enables `rfd`/`tauri::api::dialog`,
+and it is *not* in `all_features()` (which holds the per-API names `dialog-open`, `dialog-save`,
+…), so the cross-check ignores it.
+
 ## Building it
 
 Not with the Tauri CLI: `@tauri-apps/cli` v2 cannot build a v1 app, and installing the v1 CLI
@@ -67,5 +97,16 @@ just to compile is an extra moving part. `packaging/build_desktop_v1.sh` runs th
 build, then plain `cargo build --release --features custom-protocol` (that feature is what
 embeds `../dist` into the binary), then asserts the glibc ceiling and assembles the tarball.
 
-Requires `libwebkit2gtk-4.0-dev`, `libgtk-3-dev`, `libsoup2.4-dev`,
-`libayatana-appindicator3-dev`, `librsvg2-dev`, `pkg-config` and a Rust toolchain.
+Build dependencies — and this list is measured, not guessed: CI compiles the whole tree on
+bullseye with exactly these four `-dev` packages and nothing else.
+
+```
+libwebkit2gtk-4.0-dev libgtk-3-dev libsoup2.4-dev libjavascriptcoregtk-4.0-dev pkg-config
+```
+
+Note what is **absent**: no appindicator `-dev` package is required, because
+`libappindicator-sys` has no build script at all — it only `dlopen`s at runtime (see the trap
+above; `tao`'s `tray` feature pulls `gtk-sys`, which `libgtk-3-dev` already satisfies). No
+`librsvg2-dev` either. A Rust toolchain and Node for the frontend build are the other two
+requirements.
+
