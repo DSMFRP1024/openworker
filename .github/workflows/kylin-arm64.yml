@@ -30,7 +30,7 @@ permissions:
 
 env:
   # glibc 2.31 == Kylin V10 aarch64 == Debian 11. The build image sets the artifact's floor.
-  BUILD_IMAGE: python:3.11-slim-bullseye
+  BUILD_IMAGE: python:3.11-bullseye
   SMOKE_IMAGE: debian:11-slim
   GLIBC_MAX: "2.31"
   NODE_CHANNEL: latest-v20.x
@@ -41,7 +41,10 @@ jobs:
     # x86 sidecar. ubuntu-24.04-arm is free for public repos.
     runs-on: ubuntu-24.04-arm
     container:
-      image: python:3.11-slim-bullseye
+      # The FULL image, not -slim: buildpack-deps already carries git, curl, a compiler and
+      # ca-certificates, which is the difference between one installable package (patchelf)
+      # and a dependency web that the archive's frozen point release cannot satisfy.
+      image: python:3.11-bullseye
     timeout-minutes: 60
     steps:
       # Before checkout: in a container job the action runs inside the container, so git has
@@ -52,18 +55,33 @@ jobs:
           # 404s on deb.debian.org, and archive.debian.org carries no bullseye-security
           # Release file at all. Point apt at the archive (the frozen final state of the
           # release — exactly what we want to build against) with the security suite dropped,
-          # and stop demanding a valid-until date on its expired Release file. This container
-          # only needs build tooling out of main; nothing it installs is shipped.
+          # and stop demanding a valid-until date on its expired Release file.
           printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
           rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
           apt-get update
-          apt-get install -y --no-install-recommends \
-            git curl ca-certificates xz-utils build-essential patchelf
+          # Install only what is missing (the full python images ship git/curl/gcc through
+          # buildpack-deps). --allow-downgrades is the part that matters: the image carries
+          # security-updated libc6/perl-base from when it was built, while the archive's frozen
+          # main is the older point release, and libc6-dev/perl pin those versions exactly —
+          # so apt otherwise reports "held broken packages" and refuses to install anything.
+          # Nothing here is shipped; it is build tooling only.
+          want=""
+          for pair in git:git curl:curl gcc:build-essential patchelf:patchelf; do
+            command -v "${pair%%:*}" >/dev/null 2>&1 || want="$want ${pair##*:}"
+          done
+          if [ -n "$want" ]; then
+            echo "installing:$want"
+            apt-get install -y --no-install-recommends --allow-downgrades $want
+          else
+            echo "nothing to install — the image already provides git, curl, a compiler and patchelf"
+          fi
           rm -rf /var/lib/apt/lists/*
           echo "--- the base this artifact inherits its libc from ---"
           ldd --version | head -1
           python --version
+          git --version
+          (patchelf --version || echo "patchelf absent: PyInstaller will skip RPATH fixups")
 
       - uses: actions/checkout@v4
 
@@ -151,7 +169,7 @@ jobs:
           rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
           apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates
+          apt-get install -y --no-install-recommends --allow-downgrades curl ca-certificates
           rm -rf /var/lib/apt/lists/*
           echo "--- glibc of the test host ---"
           ldd --version | head -1
