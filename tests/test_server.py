@@ -637,6 +637,28 @@ def test_sidecar_token_gates_rest_and_websockets(tmp_path, monkeypatch):
     assert client.post("/oauth/callback", data={"app_state": "bad"}).status_code == 400
 
 
+def test_sidecar_token_spares_the_gui_surface(tmp_path, monkeypatch):
+    """Service mode serves the GUI off this same app, so `/` must answer without the
+    token: a browser navigation cannot carry a custom header, and the page it gets
+    back is what injects the token into the API calls after it. Gating `/` made the
+    app unreachable from a browser. The API stays gated."""
+    monkeypatch.setenv("COWORKER_API_TOKEN", "a" * 64)
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    client = TestClient(create_app(manager))
+
+    # No route exists at these paths, so reaching the router at all (404, not 401)
+    # proves the gate let them through.
+    assert client.get("/").status_code == 404
+    assert client.get("/index.html").status_code == 404
+    assert client.get("/assets/app.js").status_code == 404
+    assert client.get("/nope").status_code == 404
+
+    # The API is still closed, with or without a wrong token.
+    assert client.get("/v1/sessions").status_code == 401
+    headers = {"X-OpenWorker-Token": "a" * 64}
+    assert client.get("/v1/sessions", headers=headers).status_code == 200
+
+
 def test_ws_approval_round_trip(tmp_path):
     client = _client(
         tmp_path,

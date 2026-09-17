@@ -159,9 +159,13 @@ desktop-only voice input.
 
 Security
 --------
-The server listens on 127.0.0.1 by default and every request needs the launch token. Setting
-COWORKER_HOST=0.0.0.0 exposes shell and file tools to anyone who can reach the port: only do
-it on a trusted network.
+The server listens on 127.0.0.1 by default, so only this machine can reach it. API requests
+require the launch token — and the page served at "/" carries that token inline, because that
+is precisely how the browser comes to hold it (a navigation cannot send a custom header, so
+the page it loads is what injects the token). The consequence is worth stating plainly: anyone
+who can reach the port can read the token out of the page. The port is the trust boundary, not
+the token file. Keep it on 127.0.0.1; set COWORKER_HOST=0.0.0.0 only on a network you trust,
+because whoever can reach the port gets shell and file tools.
 EOF
 
 echo "==> [4/5] asserting the glibc ceiling ($GLIBC_MAX)"

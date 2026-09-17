@@ -223,12 +223,25 @@ jobs:
           grep -q '__COWORKER_HTTP__' index.html
           grep -q '__COWORKER_WS__' index.html
           echo "injected globals: OK"
-          asset="$(grep -o './assets/[^"]*\.js' index.html | head -1)"
-          echo "asset: $asset"
-          curl -fsS "$base/${asset#./}" -o asset.js
-          test -s asset.js
-          grep -q 'X-OpenWorker-Token' asset.js
-          echo "GUI asset served, and it is the module that sends the token header: OK"
+
+          # Check EVERY script the page loads at startup, not just the first one: which
+          # chunk carries the API module is Rollup's call, and a modulepreload link for a
+          # shared chunk is emitted before the entry <script>. (The lazy pdfjs/xlsx chunks
+          # are not referenced from index.html at all, so this stays precise.)
+          assets="$(grep -o '\./assets/[^"]*\.js' index.html | tr -d '"')"
+          echo "js assets referenced by index.html:"
+          echo "$assets"
+          test -n "$assets"
+          found=0
+          i=0
+          for a in $assets; do
+            i=$((i + 1))
+            curl -fsS "$base/${a#./}" -o "asset$i.js"
+            test -s "asset$i.js"
+            if grep -q 'X-OpenWorker-Token' "asset$i.js"; then found=1; fi
+          done
+          test "$found" = "1"
+          echo "GUI assets served, and the module that sends the token header is among them: OK"
 
           echo "--- auth gate ---"
           token="$(cat "$HOME/.config/coworker/sidecar-8899.token")"

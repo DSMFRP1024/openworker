@@ -218,6 +218,15 @@ def create_app(manager: SessionManager) -> FastAPI:
         if (
             not api_token
             or request.method == "OPTIONS"
+            # Only the API is secret. Everything the app serves outside `/v1` is
+            # either an OAuth callback (already listed above) or the GUI itself.
+            # In service mode the browser *navigates* to `/`, and a navigation
+            # cannot carry a custom header — the page that comes back is exactly
+            # what injects the token into the API calls that follow it. Gating the
+            # GUI would make the app unreachable through a browser.
+            # In desktop mode no non-`/v1` route exists at all (the webview loads
+            # its assets through Tauri's own protocol), so this is a no-op there.
+            or not request.url.path.startswith("/v1/")
             or request.url.path in tokenless_paths
             # `/v1/board` carries its own, stronger auth: per-actor board tokens
             # (identity + access), designed to be handed to external harnesses and
