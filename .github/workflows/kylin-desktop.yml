@@ -671,7 +671,13 @@ jobs:
           name: OpenWorker for Linux arm64, desktop app (Kylin V10 / glibc 2.31)
           prerelease: false
           make_latest: false
-          files: dist/**/*
+          # Upload the small, always-required assets here. The large .AppImage is pushed
+          # separately (next step) via the gh CLI, which retries per-file — action-gh-release
+          # runs on a forced Node 24 runtime in this org and flakes on big uploads
+          # ("Error saving asset") mid-stream.
+          files: |
+            dist/openworker-*.tar.gz
+            dist/SHA256SUMS
           body: |
             **Desktop builds of OpenWorker for arm64 Linux distros the normal desktop build
             cannot target.** Produced by
@@ -763,3 +769,20 @@ jobs:
             The tray needs `libayatana-appindicator3` (or the older `libappindicator3`) at
             runtime. Without it the app starts and works normally; it just loses the tray icon,
             and closing the window quits instead of hiding to the tray.
+
+      - name: Upload the AppImage (large asset — pushed via gh CLI with retries)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # action-gh-release runs on a forced Node 24 runtime in this org and dies on the
+          # multi-tens-of-MB AppImage ("Error saving asset"). The gh CLI is a Go binary —
+          # version-agnostic and self-retrying — so the big file gets its own resilient step.
+          for i in 1 2 3 4 5; do
+            if gh release upload kylin-arm64-desktop dist/openworker-*.AppImage --clobber; then
+              echo "AppImage uploaded on attempt $i"
+              break
+            fi
+            echo "AppImage upload attempt $i failed; retrying in 8s..."
+            sleep 8
+          done
