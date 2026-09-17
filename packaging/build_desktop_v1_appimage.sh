@@ -159,7 +159,7 @@ echo "==> [4.5/7] completeness pass: bundle any NEEDED library linuxdeploy skipp
 # build environment (bullseye — the correct glibc-2.31 ABI), skipping only the host-provided
 # excludelist so we never ship a conflicting copy of a system library.
 HOST_LIB="/usr/lib/$MULTIARCH"
-SKIP=" libX11.so.6 libfontconfig.so.1 libfreetype.so.6 libexpat.so.1 libGL.so.1 libEGL.so.1 libGLX.so.0 libGLdispatch.so.0 libOpenGL.so.0 libxcb.so.1 libwayland-client.so.0 libdrm.so.2 libgbm.so.1 libxkbcommon.so.0 "
+SKIP=" libX11.so.6 libfontconfig.so.1 libfreetype.so.6 libexpat.so.1 libGL.so.1 libEGL.so.1 libGLX.so.0 libGLdispatch.so.0 libOpenGL.so.0 libxcb.so.1 libwayland-client.so.0 libdrm.so.2 libgbm.so.1 libxkbcommon.so.0 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libresolv.so.2 ld-linux-aarch64.so.1 "
 bundled=0
 for elf in $(find "$APPDIR" -type f 2>/dev/null); do
   [ -f "$elf" ] || continue
@@ -204,6 +204,12 @@ cat > "$APPDIR/AppRun" <<APPRUN
 set -eu
 HERE="\$(cd "\$(dirname "\$0")" && pwd)"
 APPDIR="\${APPDIR:-\$HERE}"
+# Canonicalise to an absolute path FIRST. The AppImage runtime may hand us a RELATIVE
+# APPDIR, and every path derived from it inherits that - which is exactly what happened:
+# WebKit resolved its helpers against "." and tried
+#   "././/lib/aarch64-linux-gnu/webkit2gtk-4.0/WebKitNetworkProcess"
+# (note the missing usr/ component) instead of the bundled copy.
+APPDIR="\$(cd "\$APPDIR" && pwd)"
 export APPDIR
 # linuxdeploy places the whole GTK/WebKit closure in the multiarch subdir
 # (usr/lib/<triplet>), NOT in usr/lib. The dynamic loader does not search that subdir
@@ -227,6 +233,20 @@ if [ -d "\$APPDIR/apprun-hooks" ]; then
     . "\$hook"
   done
 fi
+# Set the helper path AFTER sourcing the hooks, deliberately: linuxdeploy-plugin-gtk's
+# hook exports its own WebKit/GTK variables, so anything exported before this point can
+# be silently overridden (and was - see above). The helpers live beside the bundled
+# libwebkit2gtk, in the multiarch subdirectory our build copied them to; point WebKit at
+# them instead of at the target machine's /usr/lib, which does not have them.
+if [ -d "\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0" ]; then
+  export WEBKIT_EXEC_PATH="\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0"
+fi
+# Diagnostics. These go to stderr so they land in the smoke job's app.log, which settles
+# any future argument about what the process actually saw at runtime.
+echo "APPRUN: APPDIR=\$APPDIR" >&2
+echo "APPRUN: WEBKIT_EXEC_PATH=\${WEBKIT_EXEC_PATH:-<unset>}" >&2
+ls -la "\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0" >&2 \
+  || echo "APPRUN: helper dir MISSING" >&2
 exec "\$APPDIR/usr/bin/openworker-desktop" "\$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"
