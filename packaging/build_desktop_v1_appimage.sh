@@ -241,15 +241,20 @@ fi
 if [ -d "\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0" ]; then
   export WEBKIT_EXEC_PATH="\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0"
 fi
-# Diagnostics. These go to stderr so they land in the smoke job's app.log, which settles
-# any future argument about what the process actually saw at runtime.
-echo "APPRUN: APPDIR=\$APPDIR" >&2
-echo "APPRUN: WEBKIT_EXEC_PATH=\${WEBKIT_EXEC_PATH:-<unset>}" >&2
-ls -la "\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0" >&2 \
-  || echo "APPRUN: helper dir MISSING" >&2
-echo "APPRUN: PWD=\$(pwd)" >&2
-echo "APPRUN: self exe=\$(readlink /proc/self/exe 2>/dev/null || echo '<unreadable>')" >&2
-env | grep -E '^(GTK_|GDK_|GSETTINGS|WEBKIT)' | sed 's/^/APPRUN ENV: /' >&2 || true
+# Diagnostics are OPT-IN, and that is load-bearing rather than tidiness. They go to stderr,
+# so they land in the smoke job's app.log - and that job greps app.log for the string
+# "WEBKIT_EXEC_PATH" to detect WebKit failing to find its helper. Printing it unconditionally
+# made the job fail on its own debug output while the app was in fact rendering fine (window
+# mapped, webview hitting the API). Export APPRUN_DEBUG=1 to get them back.
+if [ -n "\${APPRUN_DEBUG:-}" ]; then
+  echo "APPRUN: APPDIR=\$APPDIR" >&2
+  echo "APPRUN: WEBKIT_EXEC_PATH=\${WEBKIT_EXEC_PATH:-<unset>}" >&2
+  ls -la "\$APPDIR/usr/lib/$MULTIARCH/webkit2gtk-4.0" >&2 \
+    || echo "APPRUN: helper dir MISSING" >&2
+  echo "APPRUN: PWD=\$(pwd)" >&2
+  echo "APPRUN: target=\$APPDIR/usr/bin/openworker-desktop" >&2
+  env | grep -E '^(GTK_|GDK_|GSETTINGS|WEBKIT)' | sed 's/^/APPRUN ENV: /' >&2 || true
+fi
 # Run from the AppDir root. This WebKitGTK release derives its helper path from the
 # executable's location rather than honouring WEBKIT_EXEC_PATH, producing a RELATIVE
 # path with no usr/ component; making the AppDir root the working directory gives that

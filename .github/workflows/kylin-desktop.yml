@@ -574,9 +574,14 @@ jobs:
             echo "ERROR: the loader could not resolve a library at runtime" >&2
             exit 1
           fi
-          if grep -qiE 'WebKitWebProcess|Failed to start the WebKit|WEBKIT_EXEC_PATH' app.log; then
+          # Match WebKit's actual FAILURE SPEECH, not the mere presence of a helper's name.
+          # A bare grep for "WebKitWebProcess"/"WEBKIT_EXEC_PATH" also matches the AppRun's own
+          # debug lines and the directory listing of the helper dir - which is exactly how this
+          # job once failed while the app was in fact rendering (window mapped, webview reaching
+          # the API). Only these strings are evidence WebKit failed to launch a helper.
+          if grep -qiE 'Failed to execute child process|Failed to start the WebKit|error while loading shared libraries|cannot open shared object' app.log; then
             echo "ERROR: WebKit complained about its helper process:" >&2
-            grep -iE 'WebKitWebProcess|Failed to start the WebKit|WEBKIT_EXEC_PATH' app.log >&2
+            grep -iE 'Failed to execute child process|Failed to start the WebKit|error while loading shared libraries|cannot open shared object' app.log >&2
             exit 1
           fi
           echo "still running after startup: OK"
