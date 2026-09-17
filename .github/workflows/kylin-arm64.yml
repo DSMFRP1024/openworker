@@ -1,0 +1,282 @@
+name: Kylin arm64 (browser-served)
+
+# Builds the variant that runs on distros the Tauri desktop shell cannot target — Kylin V10
+# and anything else on the RHEL 8 base (webkit2gtk-4.0 only, glibc 2.31). See
+# packaging/build_service.sh for why the desktop build is impossible there.
+#
+# Two things this workflow does that the desktop one does not:
+#   1. It builds INSIDE python:3.11-slim-bullseye (glibc 2.31), not on the runner's Ubuntu
+#      24.04 host. PyInstaller freezes the interpreter it runs on, and pip picks wheels by the
+#      running glibc, so the build image — not the runner — decides the artifact's floor.
+#   2. It smoke-tests the artifact in a *clean* debian:11-slim container that has no Python at
+#      all, then asserts the GUI is served and the launch token is enforced. "Builds fine" is
+#      not evidence that it starts on the target.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/service_entry.py"
+      - "packaging/build_service.sh"
+      - "packaging/check_glibc_ceiling.py"
+      - "packaging/openworker-server.spec"
+      - "coworker/**"
+      - "surfaces/gui/**"
+      - ".github/workflows/kylin-arm64.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # glibc 2.31 == Kylin V10 aarch64 == Debian 11. The build image sets the artifact's floor.
+  BUILD_IMAGE: python:3.11-slim-bullseye
+  SMOKE_IMAGE: debian:11-slim
+  GLIBC_MAX: "2.31"
+  NODE_CHANNEL: latest-v20.x
+
+jobs:
+  build-service:
+    # Native arm64: PyInstaller cannot cross-compile, so an x86 runner could only produce an
+    # x86 sidecar. ubuntu-24.04-arm is free for public repos.
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: python:3.11-slim-bullseye
+    timeout-minutes: 60
+    steps:
+      # Before checkout: in a container job the action runs inside the container, so git has
+      # to exist first. (It is also a hard requirement for the git-pinned aisuite dependency.)
+      - name: Tooling (git, curl, compilers, patchelf)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates xz-utils build-essential patchelf
+          rm -rf /var/lib/apt/lists/*
+          echo "--- the base this artifact inherits its libc from ---"
+          ldd --version | head -1
+          python --version
+
+      - uses: actions/checkout@v4
+
+      - name: Node.js (for the GUI build)
+        run: |
+          BASE="https://nodejs.org/dist/${NODE_CHANNEL}"
+          # Resolve the exact filename from the channel index instead of pinning a version
+          # that will eventually 404.
+          FILE="$(curl -fsSL "$BASE/" | grep -o 'node-v[0-9.]*-linux-arm64\.tar\.gz' | head -1)"
+          echo "installing $FILE"
+          curl -fsSL "$BASE/$FILE" -o /tmp/node.tar.gz
+          tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1
+          rm /tmp/node.tar.gz
+          node --version
+          npm --version
+
+      - name: Install the project + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          # typer is build-time only: PyInstaller walks `mcp`, whose CLI module calls
+          # sys.exit() at import when typer is missing, which aborts the freeze.
+          pip install -e '.[bedrock]' pyinstaller typer
+
+      - name: Build the service bundle
+        env:
+          OCW_PYTHON: python3
+        run: bash packaging/build_service.sh
+
+      - name: Inspect the bundle
+        run: |
+          cd packaging/dist-service
+          tar tzf openworker-*-service.tar.gz > /tmp/list.txt
+          echo "entries: $(wc -l < /tmp/list.txt)"
+          echo "--- top level ---"
+          sed -n 's|^[^/]*/\([^/]*\).*|\1|p' /tmp/list.txt | sort -u | head -20
+          echo "--- launcher / web / sidecar binary ---"
+          grep -E 'run\.sh$|/web/index\.html$|/sidecar/openworker-service$|README\.txt$|openworker\.service$' /tmp/list.txt
+          echo "--- GUI assets ---"
+          grep -c '/web/assets/' /tmp/list.txt
+          echo "--- sidecar files ---"
+          grep -c '/sidecar/' /tmp/list.txt
+          echo "--- sizes ---"
+          ls -la openworker-*-service.tar.gz
+          cat SHA256SUMS
+          # The whole point of this variant: no GTK/WebKit, no Tauri, no Rust artifacts.
+          if grep -qE '/web/(libwebkit|libgtk)|openworker-desktop' /tmp/list.txt; then
+            echo "ERROR: desktop-shell artifacts leaked into the service bundle" >&2
+            exit 1
+          fi
+
+      - name: Assert the tarball is complete (extract + run from a staged copy)
+        run: |
+          cd packaging/dist-service
+          mkdir -p /tmp/verify && tar xzf openworker-*-service.tar.gz -C /tmp/verify
+          cd /tmp/verify/openworker-*-service
+          test -x run.sh
+          test -x sidecar/openworker-service
+          test -f web/index.html
+          # Base-relative asset URLs (vite `base: "./"`): the page must reference ./assets/…
+          grep -o 'src="[^"]*"' web/index.html | head -3
+          test -s "$(ls web/assets/*.js | head -1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openworker-linux-arm64-service
+          path: |
+            packaging/dist-service/*.tar.gz
+            packaging/dist-service/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke:
+    # The claim under test: "runs on glibc 2.31 with nothing installed". So the test host is a
+    # bare Debian 11 with no Python, no GUI libraries, and no build tooling.
+    needs: build-service
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:11-slim
+    timeout-minutes: 30
+    steps:
+      - name: Tooling (curl only)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl
+          rm -rf /var/lib/apt/lists/*
+          echo "--- glibc of the test host ---"
+          ldd --version | head -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64-service
+          path: dl
+
+      - name: Prove the host really has nothing to fall back on
+        run: |
+          if command -v python3 >/dev/null || command -v python >/dev/null; then
+            echo "ERROR: a Python is installed here, so this test cannot prove self-containment" >&2
+            exit 1
+          fi
+          echo "no python on the host: OK (the frozen runtime must carry itself)"
+
+      - name: Start, then assert the API, the GUI and the token gate
+        run: |
+          set -euo pipefail
+          cd dl && tar xzf openworker-*-service.tar.gz && cd openworker-*-service
+          ./run.sh --port 8899 > server.log 2>&1 &
+          echo "--- startup banner ---"
+          for i in $(seq 1 60); do
+            grep -q 'OpenWorker service mode' server.log 2>/dev/null && break
+            sleep 1
+          done
+          cat server.log
+
+          base=http://127.0.0.1:8899
+          for i in $(seq 1 60); do
+            curl -fsS "$base/v1/health" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "--- /v1/health ---"
+          health="$(curl -fsS "$base/v1/health")"
+          echo "$health"
+          echo "$health" | grep -q '"status": *"ok"'
+
+          echo "--- GET / (GUI, with runtime wiring injected) ---"
+          curl -fsS "$base/" -o index.html
+          grep -q '__COWORKER_API_TOKEN__' index.html
+          grep -q '__COWORKER_HTTP__' index.html
+          grep -q '__COWORKER_WS__' index.html
+          echo "injected globals: OK"
+          asset="$(grep -o './assets/[^"]*\.js' index.html | head -1)"
+          echo "asset: $asset"
+          curl -fsS "$base/${asset#./}" -o asset.js
+          test -s asset.js
+          grep -q 'X-OpenWorker-Token' asset.js
+          echo "GUI asset served and it is the module that sends the token header: OK"
+
+          echo "--- auth gate ---"
+          token="$(cat "$HOME/.config/coworker/sidecar-8899.token")"
+          no="$(curl -s -o /dev/null -w '%{http_code}' "$base/v1/sessions")"
+          yes="$(curl -s -o /dev/null -w '%{http_code}' -H "X-OpenWorker-Token: $token" "$base/v1/sessions")"
+          echo "no token -> $no | with token -> $yes"
+          [ "$no" = "401" ]
+          [ "$yes" = "200" ]
+
+          echo "--- unknown path is not silently index.html ---"
+          unknown="$(curl -s -o /dev/null -w '%{http_code}' "$base/nope")"
+          echo "GET /nope -> $unknown"
+          [ "$unknown" = "404" ]
+
+          kill %1 2>/dev/null || true
+          echo "SMOKE_OK"
+
+      - name: Server log on failure
+        if: failure()
+        run: |
+          find dl -name server.log -exec cat {} \; || true
+
+  release:
+    # A stable URL beats a per-run artifact: the tag never moves, so
+    #   github.com/<owner>/openworker/releases/download/kylin-arm64/<file>
+    # keeps working across rebuilds. `make_latest: false` keeps this clear of the fork's
+    # other build tags.
+    needs: [build-service, smoke]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openworker-linux-arm64-service
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kylin-arm64
+          name: OpenWorker for Linux arm64, browser-served (Kylin V10 / glibc 2.31)
+          prerelease: false
+          make_latest: false
+          files: dist/**/*
+          body: |
+            **Browser-served arm64 build of OpenWorker**, for distros the desktop shell cannot
+            be built for. Produced by
+            [`.github/workflows/kylin-arm64.yml`](../blob/main/.github/workflows/kylin-arm64.yml)
+            inside a glibc 2.31 image, and smoke-tested in a bare Debian 11 container.
+
+            Tested target: **Kylin V10 (aarch64), glibc 2.31** — also Debian 11, Ubuntu 20.04,
+            and anything newer.
+
+            | File | What it is |
+            | --- | --- |
+            | `openworker-*-linux-aarch64-service.tar.gz` | Unpack anywhere and run `./run.sh`. |
+            | `SHA256SUMS` | Checksum for the file above. |
+
+            ```bash
+            tar xzf openworker-*-linux-aarch64-service.tar.gz
+            cd openworker-*-linux-aarch64-service
+            ./run.sh                       # http://127.0.0.1:8765/
+            # no browser on that box? tunnel to it:
+            #   ssh -L 8765:127.0.0.1:8765 <user>@<host>
+            ```
+
+            ### Why not the desktop build here
+
+            The desktop app is a Tauri webview and needs `webkit2gtk-4.1` plus glibc ≥ 2.39 as
+            built. The RHEL 8 base has neither — its repos stop at `webkit2gtk-4.0`, and Tauri
+            v2 dropped 4.0 support — so no amount of packaging makes the desktop variant run
+            on Kylin V10. This variant keeps the *same server and the same GUI* and serves the
+            GUI over HTTP; any local browser is the shell. Voice input is the one feature that
+            does not carry over (the dictation engine is macOS/Windows only).
+
+            Nothing to install: the bundle carries CPython, the agent runtime and the GUI, so
+            it needs no package manager, no root, no FUSE, and no system GTK/WebKit.
+
+            ### Verified in CI
+
+            - the artifact's highest glibc requirement is asserted to be ≤ 2.31
+              (`packaging/check_glibc_ceiling.py`, which fails the build otherwise)
+            - it starts on a Debian 11 container that has **no Python installed at all**
+            - `GET /` returns the GUI with the runtime wiring injected, and its JS asset loads
+            - `GET /v1/sessions` returns 401 without the launch token and 200 with it
+
+            The server listens on `127.0.0.1` by default; the launch token (printed at startup,
+            stored in `~/.config/coworker/sidecar-<port>.token`) is already wired into the
+            page, so the browser needs no setup.

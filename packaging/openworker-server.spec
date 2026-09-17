@@ -18,6 +18,11 @@ appends `.exe` to `name`. The binary is built as a normal console app on every O
 and hangs the server. To avoid a console window flashing in the desktop app, the Tauri shell
 spawns this sidecar with the Windows CREATE_NO_WINDOW flag (see src-tauri/src/lib.rs), which
 hides the window while keeping stdio intact.
+
+COWORKER_SERVICE=1 builds the browser-served variant instead (`openworker-service`, entry
+`service_entry.py`): same dependency set, but the GUI is mounted on the server and a browser is
+the client. That is the packaging for distros the Tauri shell cannot target at all (Kylin V10:
+no webkit2gtk-4.1, glibc 2.31). See packaging/build_service.sh.
 """
 
 import os
@@ -31,6 +36,12 @@ PACKAGING = SPECPATH
 ROOT = os.path.dirname(PACKAGING)
 
 IS_WINDOWS = sys.platform == "win32"
+
+# Service mode: identical bundle, different entry point (see module docstring). Off by
+# default so the desktop build is byte-for-byte unaffected by this switch.
+SERVICE = os.environ.get("COWORKER_SERVICE") == "1"
+ENTRY = "service_entry.py" if SERVICE else "server_entry.py"
+NAME = "openworker-service" if SERVICE else "openworker-server"
 
 # Experimental (use-at-your-own-risk) connectors are excluded from official builds: the code
 # is stripped, not just disabled. Self-builders opt in with COWORKER_EXPERIMENTAL=1; the
@@ -96,7 +107,7 @@ for pkg in ("slack_bolt", "telegram"):  # [messaging] extra — optional
         pass
 
 a = Analysis(
-    [os.path.join(PACKAGING, "server_entry.py")],
+    [os.path.join(PACKAGING, ENTRY)],
     pathex=[ROOT],
     binaries=binaries,
     datas=datas,
@@ -113,7 +124,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="openworker-server",
+    name=NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -131,5 +142,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="openworker-server",
+    name=NAME,
 )
