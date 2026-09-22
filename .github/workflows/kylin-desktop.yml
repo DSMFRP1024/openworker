@@ -19,6 +19,7 @@ on:
       - "packaging/build_desktop_v1.sh"
       - "packaging/build_desktop_v1_appimage.sh"
       - "packaging/check_glibc_ceiling.py"
+      - "packaging/diagnose-linux-gui.sh"
       - "packaging/openworker-server.spec"
       - "surfaces/gui/src-tauri-v1/**"
       - "surfaces/gui/src/**"
@@ -442,7 +443,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     container:
       image: debian:11-slim
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Test tooling only — deliberately NOT the GUI libraries
         run: |
@@ -632,6 +633,53 @@ jobs:
         run: |
           find dl -name app.log -exec echo "=== {} ===" \; -exec cat {} \; || true
           cat "$HOME/.config/coworker/logs/openworker-server.log" 2>/dev/null || true
+
+      - name: Right-click regression probe (diagnostic, never blocks the job)
+        # Field report: on a host whose graphics driver has no working 3D, right-clicking
+        # anywhere makes the WHOLE app exit. That is a UI-process death, not a renderer one —
+        # a dead WebKitWebProcess leaves the window up and merely blank. This job is the only
+        # place we have a GPU-less host to reproduce it on, so it runs the very same
+        # packaging/diagnose-linux-gui.sh we hand to users; what it prints here is what it
+        # would print on their machine. Non-blocking on purpose: it has to be able to report a
+        # crash without turning the release red while the cause is still being pinned down.
+        if: always()
+        continue-on-error: true
+        run: |
+          APP="$(ls dl/openworker-*.AppImage 2>/dev/null | head -1)"
+          [ -n "$APP" ] || { echo "no AppImage to probe"; exit 0; }
+          # Fetch the diagnostic at the exact commit under test, so the probe cannot drift
+          # from the source tree it is meant to be evidence about.
+          curl -fsS --retry 5 --retry-delay 3 \
+            -o /tmp/diagnose-linux-gui.sh \
+            "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/packaging/diagnose-linux-gui.sh"
+          chmod +x /tmp/diagnose-linux-gui.sh
+
+          export DISPLAY=:98
+          Xvfb :98 -screen 0 1440x1000x24 >/dev/null 2>&1 &
+          xvfb_pid=$!
+          sleep 3
+          export XDG_RUNTIME_DIR=/tmp/xdg-diag
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          # The same container accommodations the launch step above needs, plus
+          # LIBGL_ALWAYS_SOFTWARE=1 — which is the closest this host gets to the field
+          # machine's actual condition: a driver that is present but has no 3D.
+          export WEBKIT_FORCE_SANDBOX=0
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          dbus-run-session -- bash /tmp/diagnose-linux-gui.sh "$PWD/$APP" || true
+
+          kill "$xvfb_pid" 2>/dev/null || true
+
+      - name: Right-click diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openworker-rightclick-diagnostic
+          path: diagnose-report-*/
+          if-no-files-found: ignore
+          retention-days: 14
 
   release:
     # A stable URL beats a per-run artifact: the tag never moves, so
